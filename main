@@ -1,0 +1,128 @@
+import requests
+import time
+import statistics
+
+ACCESS_TOKEN = ""
+HEADERS = {
+    "Authorization": f"Bearer {ACCESS_TOKEN}",
+    "Content-Type": "application/json",
+    "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+}
+
+CARDS = [
+    {"player": "Anthony Edwards", "set": "Optic", "number": "151", "parallel": "Fanatics"},
+    {"player": "Anthony Edwards", "set": "Optic", "number": "151", "parallel": "Target"},
+    {"player": "Anthony Edwards", "set": "Optic", "number": "151", "parallel": "Pink Hyper"},
+    {"player": "Bo Nix", "set": "Optic", "number": "369", "parallel": "Red Wave"},
+    {"player": "Bo Nix", "set": "Optic", "number": "209", "parallel": "Pink Prizm"},
+    {"player": "Drake Maye", "set": "Optic", "number": "229", "parallel": "Holo"},
+    {"player": "Jayden Daniels", "set": "Optic", "number": "248", "parallel": "Holo"},
+    {"player": "Jayden Daniels", "set": "Optic", "number": "248", "parallel": "Green Velocity"},
+    {"player": "JJ McCarthy", "set": "Optic", "number": "235", "parallel": "Holo"},
+    {"player": "JJ McCarthy", "set": "Prizm", "number": "400", "parallel": "Orange Disco"},
+    {"player": "JJ McCarthy", "set": "Bowman", "number": "124", "parallel": "Auto"},
+    {"player": "Josh Allen", "set": "Donruss", "number": "304", "parallel": "Base"},
+    {"player": "Justin Jefferson", "set": "Immaculate", "number": "107", "parallel": "RPA"},
+    {"player": "John Elway", "set": "Optic", "number": "23", "parallel": "Uptowns"},
+    {"player": "Terry Bradshaw", "set": "Optic", "number": "25", "parallel": "Uptowns"},
+    {"player": "Roger Staubach", "set": "Optic", "number": "24", "parallel": "Uptowns"},
+]
+
+PAID_PRICES = {
+    "Anthony Edwards": -57.77,
+    "Bo Nix": -54.59,
+    "Drake Maye": -49.92,
+    "Jayden Daniels": -96.86,
+    "JJ McCarthy": -52.47,
+    "Josh Allen": -93.81,
+    "Justin Jefferson": -87.34,
+    "John Elway": -129.24,
+    "Terry Bradshaw": -118.83,
+    "Roger Staubach": -123.83,
+}
+
+def build_query(card, psa_grade):
+    parallel = card.get("parallel") or "Base"
+    return f'{card["player"]} {card["set"]} #{card["number"]} "{parallel}" PSA {psa_grade}'
+
+def trimmed_average(prices, trim_ratio=0.15):
+    if not prices:
+        return None
+    prices_sorted = sorted(prices)
+    cut = int(len(prices_sorted) * trim_ratio)
+    trimmed = prices_sorted[cut:len(prices_sorted)-cut] if len(prices_sorted) > 2*cut else prices_sorted
+    return statistics.mean(trimmed) if trimmed else None
+
+def search_sold_prices(session, card, psa_grades=("9", "10"), limit=100, retries=3, delay=2):
+    results = {}
+    for grade in psa_grades:
+        query = build_query(card, grade)
+        url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+        params = {
+            "q": query,
+            "limit": limit,
+            "filter": "priceCurrency:USD,soldItems:true,itemLocationCountry:US,conditions:{3000},buyingOptions:{FIXED_PRICE}",
+        }
+
+        prices = []
+        for attempt in range(1, retries + 1):
+            try:
+                resp = session.get(url, headers=HEADERS, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+
+                for item in data.get("itemSummaries", []):
+                    price = float(item["price"]["value"])
+                    title = item.get("title", "").lower()
+
+                    # Filter out wrong parallels or wrong grades
+                    if str(grade) not in title:
+                        continue
+                    if card["parallel"].lower() not in title:
+                        continue
+                    if "psa" not in title:
+                        continue
+                    if "auto" in title and "auto" not in card["parallel"].lower():
+                        continue
+
+                    # Ignore absurd prices
+                    if price <= 5 or price >= 5000:
+                        continue
+
+                    prices.append(price)
+
+                break  # success, stop retrying
+            except Exception as e:
+                print(f"Attempt {attempt} failed for '{query}': {e}")
+                if attempt == retries:
+                    prices = []
+                else:
+                    time.sleep(delay)
+
+        results[grade] = prices
+    return results
+
+def main():
+    session = requests.Session()
+
+    for card in CARDS:
+        prices = search_sold_prices(session, card)
+        avg9 = trimmed_average(prices.get("9", []))
+        avg10 = trimmed_average(prices.get("10", []))
+        paid = abs(PAID_PRICES.get(card["player"], 0))
+
+        print(f"{card['player']:<16} {card['set']:<10} #{card['number']:<4} {card.get('parallel','Base'):<15}")
+        if avg9:
+            print(f"  PSA 9 Avg:  ${avg9:8.2f}  Expected Profit: ${avg9 - paid:8.2f}")
+        else:
+            print("  PSA 9: No data")
+        if avg10:
+            print(f"  PSA 10 Avg: ${avg10:8.2f}  Expected Profit: ${avg10 - paid:8.2f}")
+        else:
+            print("  PSA 10: No data")
+        print()
+        time.sleep(1.2)
+
+if __name__ == "__main__":
+    main()
+
