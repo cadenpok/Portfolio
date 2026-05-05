@@ -1,0 +1,817 @@
+import streamlit as st
+import pandas as pd
+import sqlite3
+from datetime import datetime, timedelta, date, time
+import json
+import plotly.express as px
+
+# ─────────────────────────────────────────────
+#  DATABASE
+# ─────────────────────────────────────────────
+DB = "wealth_tasks.db"
+
+def get_conn():
+    conn = sqlite3.connect(DB, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_conn()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            category          TEXT    NOT NULL,
+            task_name         TEXT    NOT NULL,
+            priority          TEXT    NOT NULL,
+            deadline_date     DATE    NOT NULL,
+            deadline_time     TEXT    DEFAULT '',
+            reminder_datetime TEXT    DEFAULT '',
+            client            TEXT    DEFAULT '',
+            status            TEXT    DEFAULT 'Open',
+            notes             TEXT    DEFAULT '',
+            created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+            completed_at      DATETIME
+        );
+        CREATE TABLE IF NOT EXISTS clients (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            name      TEXT NOT NULL UNIQUE,
+            phone     TEXT DEFAULT '',
+            email     TEXT DEFAULT '',
+            company   TEXT DEFAULT '',
+            advisor   TEXT DEFAULT '',
+            notes     TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+    """)
+
+    # Migrate old schemas gracefully
+
+    # Rename old 'deadline' column to 'deadline_date' if needed
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+    if "deadline" in cols and "deadline_date" not in cols:
+        conn.executescript("""
+            ALTER TABLE tasks RENAME TO tasks_old;
+            CREATE TABLE tasks (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                category          TEXT    NOT NULL,
+                task_name         TEXT    NOT NULL,
+                priority          TEXT    NOT NULL,
+                deadline_date     DATE    NOT NULL,
+                deadline_time     TEXT    DEFAULT '',
+                reminder_datetime TEXT    DEFAULT '',
+                client            TEXT    DEFAULT '',
+                status            TEXT    DEFAULT 'Open',
+                notes             TEXT    DEFAULT '',
+                created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at      DATETIME
+            );
+            INSERT INTO tasks (id, category, task_name, priority, deadline_date, status, notes, created_at, completed_at)
+            SELECT id, category, task_name, priority, deadline, status, notes, created_at, completed_at
+            FROM tasks_old;
+            DROP TABLE tasks_old;
+        """)
+
+    migrations_tasks = [
+        ("deadline_time",     "''"),
+        ("reminder_datetime", "''"),
+        ("client",            "''"),
+    ]
+    for col, default in migrations_tasks:
+        try:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT DEFAULT {default}")
+        except Exception:
+            pass
+
+    migrations_clients = [
+        ("phone",   "''"),
+        ("email",   "''"),
+        ("company", "''"),
+        ("notes",   "''"),
+    ]
+    for col, default in migrations_clients:
+        try:
+            conn.execute(f"ALTER TABLE clients ADD COLUMN {col} TEXT DEFAULT {default}")
+        except Exception:
+            pass
+
+    # Seed demo clients
+    if conn.execute("SELECT COUNT(*) FROM clients").fetchone()[0] == 0:
+        demo = [
+            ("Harrington Family",  "312-555-0181", "harrington@email.com",  "Harrington Holdings LLC",  "You", "Prefers morning calls. Birthday in March."),
+            ("Westbrook Trust",    "312-555-0294", "trust@westbrook.com",   "Westbrook Family Office",  "You", "Quarterly reviews only. Contact: Margaret."),
+            ("Okafor & Associates","312-555-0347", "okafor@assoc.com",      "Okafor & Associates CPAs", "You", "Tax-sensitive. CC CPA on all correspondence."),
+            ("Rivera Retirement",  "312-555-0412", "jrivera@email.com",     "",                         "You", "Recently widowed. Very hands-on client."),
+        ]
+        conn.executemany("INSERT INTO clients (name,phone,email,company,advisor,notes) VALUES (?,?,?,?,?,?)", demo)
+
+    # Seed default settings
+    defaults = {
+        "dash_show_overdue":     "true",
+        "dash_show_today":       "true",
+        "dash_show_reminders":   "true",
+        "dash_urgency_days":     "3",
+        "dash_max_cards":        "8",
+        "dash_show_chart":       "true",
+        "dash_metric_open":      "true",
+        "dash_metric_critical":  "true",
+        "dash_metric_overdue":   "true",
+        "dash_metric_closed":    "true",
+        "dash_metric_reminders": "true",
+        "task_categories":       json.dumps(["Proposal","Client Call","Service Request","Tax Documents","Compliance","Portfolio Review","General"]),
+        "priority_levels":       json.dumps(["Low","Medium","High","Critical"]),
+    }
+    for k, v in defaults.items():
+        conn.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", (k, v))
+
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ─────────────────────────────────────────────
+#  SETTINGS HELPERS
+# ─────────────────────────────────────────────
+def get_setting(key, fallback=""):
+    conn = get_conn()
+    row  = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else fallback
+
+def set_setting(key, value):
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, str(value)))
+    conn.commit()
+    conn.close()
+
+def get_categories():
+    try:    return json.loads(get_setting("task_categories"))
+    except: return ["General"]
+
+def get_priorities():
+    try:    return json.loads(get_setting("priority_levels"))
+    except: return ["Low","Medium","High","Critical"]
+
+# ─────────────────────────────────────────────
+#  CONSTANTS
+# ─────────────────────────────────────────────
+STATUSES = ["Open", "In Progress", "Waiting", "Completed", "Cancelled"]
+
+PRIORITY_COLORS = {
+    "Low":      "#22c55e",
+    "Medium":   "#f59e0b",
+    "High":     "#ef4444",
+    "Critical": "#7c3aed",
+}
+STATUS_COLORS = {
+    "Open":        "#3b82f6",
+    "In Progress": "#f59e0b",
+    "Waiting":     "#8b5cf6",
+    "Completed":   "#22c55e",
+    "Cancelled":   "#6b7280",
+}
+REMINDER_OPTIONS = {
+    "None":          "",
+    "At deadline":   "at",
+    "15 min before": "15m",
+    "30 min before": "30m",
+    "1 hour before": "1h",
+    "2 hours before":"2h",
+    "1 day before":  "1d",
+    "2 days before": "2d",
+}
+
+# ─────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────
+def days_label(d: date) -> str:
+    diff = (d - date.today()).days
+    if diff < 0:  return f"⚠️ {abs(diff)}d overdue"
+    if diff == 0: return "🔴 Due today"
+    if diff == 1: return "🟠 Due tomorrow"
+    if diff <= 7: return f"🟡 {diff}d left"
+    return f"🟢 {diff}d left"
+
+def priority_badge(p):
+    c = PRIORITY_COLORS.get(p, "#888")
+    return f'<span style="background:{c};color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700">{p}</span>'
+
+def status_badge(s):
+    c = STATUS_COLORS.get(s, "#888")
+    return f'<span style="background:{c};color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700">{s}</span>'
+
+def compute_reminder_dt(deadline_date, deadline_time_str, offset_code):
+    if not offset_code:
+        return ""
+    try:
+        if deadline_time_str:
+            h, m    = map(int, deadline_time_str.split(":"))
+            base_dt = datetime.combine(deadline_date, time(h, m))
+        else:
+            base_dt = datetime.combine(deadline_date, time(9, 0))
+        offsets = {
+            "at": timedelta(0), "15m": timedelta(minutes=15), "30m": timedelta(minutes=30),
+            "1h": timedelta(hours=1),  "2h": timedelta(hours=2),
+            "1d": timedelta(days=1),   "2d": timedelta(days=2),
+        }
+        return (base_dt - offsets.get(offset_code, timedelta(0))).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+def get_clients():
+    conn = get_conn()
+    rows = conn.execute("SELECT name FROM clients ORDER BY name").fetchall()
+    conn.close()
+    return ["— None —"] + [r[0] for r in rows]
+
+def load_tasks(status_filter=None, category_filter=None, priority_filter=None, search=""):
+    conn = get_conn()
+    q    = "SELECT * FROM tasks WHERE 1=1"
+    p    = []
+    if status_filter and status_filter != "All":
+        q += " AND status=?"; p.append(status_filter)
+    if category_filter and category_filter != "All":
+        q += " AND category=?"; p.append(category_filter)
+    if priority_filter and priority_filter != "All":
+        q += " AND priority=?"; p.append(priority_filter)
+    if search:
+        q += " AND (task_name LIKE ? OR notes LIKE ? OR client LIKE ?)"; p += [f"%{search}%"]*3
+    priorities = get_priorities()
+    pri_order  = " ".join([f"WHEN '{pr}' THEN {i}" for i, pr in enumerate(reversed(priorities))])
+    q += f" ORDER BY CASE priority {pri_order} ELSE 99 END, deadline_date ASC"
+    df = pd.read_sql_query(q, conn, params=p)
+    conn.close()
+    return df
+
+def get_upcoming_reminders(hours_ahead=2):
+    conn = get_conn()
+    now  = datetime.now()
+    soon = now + timedelta(hours=hours_ahead)
+    rows = conn.execute("""
+        SELECT id, task_name, priority, reminder_datetime, deadline_date, client
+        FROM tasks
+        WHERE status NOT IN ('Completed','Cancelled')
+          AND reminder_datetime != ''
+          AND reminder_datetime <= ?
+        ORDER BY reminder_datetime ASC
+    """, (soon.strftime("%Y-%m-%d %H:%M"),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# ─────────────────────────────────────────────
+#  PAGE CONFIG & CSS
+# ─────────────────────────────────────────────
+st.set_page_config(page_title="Task Engine", page_icon="⚡", layout="wide", initial_sidebar_state="expanded")
+
+st.markdown("""
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');
+
+  html, body, [class*="css"] { font-family:'DM Sans',sans-serif; }
+  .stApp { background:#0d1117; color:#e6edf3; }
+
+  section[data-testid="stSidebar"] { background:#161b22 !important; border-right:1px solid #30363d; }
+  section[data-testid="stSidebar"] * { color:#c9d1d9 !important; }
+
+  .metric-tile {
+    background:#161b22; border:1px solid #30363d; border-radius:12px;
+    padding:20px 24px; text-align:center; transition:border-color .2s; margin-bottom:12px;
+  }
+  .metric-tile:hover { border-color:#58a6ff; }
+  .metric-tile .num { font-family:'Syne',sans-serif; font-size:2.4rem; font-weight:800; }
+  .metric-tile .lbl { font-size:.78rem; color:#8b949e; text-transform:uppercase; letter-spacing:.08em; margin-top:4px; }
+
+  .task-card {
+    background:#161b22; border:1px solid #30363d; border-radius:12px;
+    padding:18px 22px; margin-bottom:12px; transition:border-color .2s, transform .15s;
+  }
+  .task-card:hover { border-color:#58a6ff; transform:translateX(3px); }
+  .task-card.overdue  { border-left:4px solid #ef4444; }
+  .task-card.due-soon { border-left:4px solid #f59e0b; }
+  .task-card.ok       { border-left:4px solid #22c55e; }
+  .task-card.done     { opacity:.4; }
+
+  .task-title { font-family:'Syne',sans-serif; font-weight:700; font-size:1.05rem; margin-bottom:6px; }
+  .task-meta  { font-size:.8rem; color:#8b949e; line-height:2; }
+  .task-notes { font-size:.82rem; color:#adbac7; margin-top:8px; font-style:italic; background:#0d1117; border-radius:6px; padding:8px 10px; }
+  .reminder-pill { display:inline-block; background:#1e2d3d; border:1px solid #1f6feb; color:#79c0ff; padding:2px 10px; border-radius:20px; font-size:11px; font-weight:600; }
+  .notif-card { background:#1a1200; border:1px solid #f59e0b; border-radius:10px; padding:12px 16px; margin-bottom:8px; font-size:.85rem; color:#fcd34d; }
+
+  h1,h2,h3 { font-family:'Syne',sans-serif !important; }
+  .page-title { font-family:'Syne',sans-serif; font-size:2rem; font-weight:800; letter-spacing:-.02em; margin-bottom:4px; }
+  .section-header { font-family:'Syne',sans-serif; font-size:1.05rem; font-weight:700; color:#58a6ff; border-bottom:1px solid #21262d; padding-bottom:8px; margin:24px 0 16px; }
+
+  .stTextInput input, .stTextArea textarea {
+    background:#0d1117 !important; border:1px solid #30363d !important;
+    color:#e6edf3 !important; border-radius:8px !important;
+  }
+  .stSelectbox > div > div { background:#0d1117 !important; color:#e6edf3 !important; }
+  .stButton > button {
+    background:#1f6feb !important; color:#fff !important; border:none !important;
+    border-radius:8px !important; font-weight:600 !important; transition:background .2s !important;
+  }
+  .stButton > button:hover { background:#388bfd !important; }
+  div[data-testid="stExpander"] { background:#161b22; border:1px solid #30363d; border-radius:12px; }
+  #MainMenu, footer, header { visibility:hidden; }
+  .block-container { padding-top:1.5rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+#  SIDEBAR
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.markdown('<div style="font-family:Syne,sans-serif;font-size:1.4rem;font-weight:800;color:#58a6ff;margin-bottom:4px">⚡ Task Engine</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:.75rem;color:#6e7681;margin-bottom:24px">Wealth Operations Center</div>', unsafe_allow_html=True)
+
+    page = st.radio("Navigate", [
+        "📊 Dashboard", "📋 Task Board", "➕ Add Task",
+        "✏️ Edit Task", "📈 Analytics", "👥 Clients", "⚙️ Settings"
+    ], label_visibility="collapsed")
+
+    st.markdown("---")
+    st.markdown("**🔍 Filters**")
+    f_status   = st.selectbox("Status",   ["All"] + STATUSES,         key="f_status")
+    f_category = st.selectbox("Category", ["All"] + get_categories(), key="f_category")
+    f_priority = st.selectbox("Priority", ["All"] + get_priorities(), key="f_priority")
+    f_search   = st.text_input("Search…", key="f_search")
+
+    st.markdown("---")
+    conn      = get_conn()
+    overdue_n = conn.execute("SELECT COUNT(*) FROM tasks WHERE status NOT IN ('Completed','Cancelled') AND deadline_date < date('now')").fetchone()[0]
+    due_today = conn.execute("SELECT COUNT(*) FROM tasks WHERE status NOT IN ('Completed','Cancelled') AND deadline_date = date('now')").fetchone()[0]
+    conn.close()
+    reminders = get_upcoming_reminders(hours_ahead=2)
+
+    if overdue_n:
+        st.markdown(f'<div style="color:#ef4444;font-weight:700">⚠️ {overdue_n} overdue</div>', unsafe_allow_html=True)
+    if due_today:
+        st.markdown(f'<div style="color:#f59e0b;font-weight:700">🔔 {due_today} due today</div>', unsafe_allow_html=True)
+    if reminders:
+        st.markdown(f'<div style="color:#79c0ff;font-weight:700">🔔 {len(reminders)} reminder{"s" if len(reminders)>1 else ""} firing soon</div>', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+#  PAGE: DASHBOARD
+# ─────────────────────────────────────────────
+if page == "📊 Dashboard":
+    st.markdown('<div class="page-title">Good morning. Here\'s your pipeline.</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:#6e7681;font-size:.85rem;margin-bottom:24px">{datetime.now().strftime("%A, %B %d, %Y  •  %I:%M %p")}</div>', unsafe_allow_html=True)
+
+    conn           = get_conn()
+    total_open     = conn.execute("SELECT COUNT(*) FROM tasks WHERE status NOT IN ('Completed','Cancelled')").fetchone()[0]
+    total_critical = conn.execute("SELECT COUNT(*) FROM tasks WHERE priority='Critical' AND status NOT IN ('Completed','Cancelled')").fetchone()[0]
+    total_overdue  = conn.execute("SELECT COUNT(*) FROM tasks WHERE status NOT IN ('Completed','Cancelled') AND deadline_date < date('now')").fetchone()[0]
+    closed_week    = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='Completed' AND completed_at >= date('now','-7 days')").fetchone()[0]
+    conn.close()
+    rem_24         = get_upcoming_reminders(hours_ahead=24)
+
+    tile_defs = [
+        (total_open,     "Open Tasks",        "#58a6ff", get_setting("dash_metric_open")     == "true"),
+        (total_critical, "Critical Priority", "#ef4444", get_setting("dash_metric_critical") == "true"),
+        (total_overdue,  "Overdue",           "#f59e0b", get_setting("dash_metric_overdue")  == "true"),
+        (closed_week,    "Closed This Week",  "#22c55e", get_setting("dash_metric_closed")   == "true"),
+        (len(rem_24),    "Reminders (24h)",   "#a78bfa", get_setting("dash_metric_reminders")== "true"),
+    ]
+    active = [(n, l, c) for n, l, c, show in tile_defs if show]
+    if active:
+        cols = st.columns(len(active))
+        for col, (num, label, color) in zip(cols, active):
+            col.markdown(f'<div class="metric-tile"><div class="num" style="color:{color}">{num}</div><div class="lbl">{label}</div></div>', unsafe_allow_html=True)
+
+    # Reminders panel
+    if get_setting("dash_show_reminders") == "true" and rem_24:
+        st.markdown('<div class="section-header">🔔 Upcoming Reminders</div>', unsafe_allow_html=True)
+        for r in rem_24:
+            rem_dt = datetime.strptime(r["reminder_datetime"], "%Y-%m-%d %H:%M")
+            mins   = int((rem_dt - datetime.now()).total_seconds() / 60)
+            timing = f"in {mins} min" if mins > 0 else "NOW"
+            client_str = f" · {r['client']}" if r.get("client") else ""
+            st.markdown(f'<div class="notif-card">🔔 <b>{r["task_name"]}</b>{client_str}<span style="float:right;opacity:.7">{rem_dt.strftime("%I:%M %p")} ({timing})</span></div>', unsafe_allow_html=True)
+
+    # Urgent feed
+    urgency_days = int(get_setting("dash_urgency_days", "3"))
+    max_cards    = int(get_setting("dash_max_cards", "8"))
+    st.markdown(f'<div class="section-header">🔥 Needs Attention — Next {urgency_days} Day{"s" if urgency_days!=1 else ""}</div>', unsafe_allow_html=True)
+
+    df     = load_tasks()
+    cutoff = date.today() + timedelta(days=urgency_days)
+    urgent = df[
+        df["status"].isin(["Open","In Progress","Waiting"]) &
+        (pd.to_datetime(df["deadline_date"]).dt.date <= cutoff)
+    ].head(max_cards)
+
+    if urgent.empty:
+        st.markdown('<div style="color:#6e7681;font-size:.9rem;padding:12px 0">✅ Nothing urgent in the next few days. Stay ahead of it.</div>', unsafe_allow_html=True)
+    else:
+        for _, row in urgent.iterrows():
+            dl        = pd.to_datetime(row["deadline_date"]).date()
+            diff      = (dl - date.today()).days
+            cls       = "overdue" if diff < 0 else "due-soon" if diff <= 2 else "ok"
+            time_str  = f" @ {row['deadline_time']}" if row.get("deadline_time") else ""
+            client_str= f"👤 {row['client']} &nbsp;·&nbsp;" if row.get("client") else ""
+            rem_html  = f'<span class="reminder-pill">🔔 {row["reminder_datetime"]}</span>' if row.get("reminder_datetime") else ""
+            notes_html= f'<div class="task-notes">📝 {row["notes"]}</div>' if row.get("notes") else ""
+            st.markdown(f"""
+            <div class="task-card {cls}">
+              <div class="task-title">{row["task_name"]}</div>
+              <div class="task-meta">
+                {priority_badge(row["priority"])} &nbsp; {status_badge(row["status"])}
+                &nbsp;&nbsp; {client_str}📁 {row["category"]}
+                &nbsp;·&nbsp; 📅 {dl.strftime("%b %d")}{time_str} ({days_label(dl)})
+                {"&nbsp;&nbsp;" + rem_html if rem_html else ""}
+              </div>
+              {notes_html}
+            </div>""", unsafe_allow_html=True)
+
+    if get_setting("dash_show_chart") == "true":
+        st.markdown('<div class="section-header">📊 Pipeline by Category</div>', unsafe_allow_html=True)
+        df_open = df[df["status"].isin(["Open","In Progress","Waiting"])]
+        if not df_open.empty:
+            cat_counts = df_open.groupby("category").size().reset_index(name="count")
+            fig = px.bar(cat_counts, x="category", y="count", color="category",
+                         color_discrete_sequence=["#1f6feb","#388bfd","#58a6ff","#79c0ff","#a5d6ff","#cae8ff","#ddf4ff"],
+                         template="plotly_dark")
+            fig.update_layout(paper_bgcolor="#161b22", plot_bgcolor="#161b22",
+                              showlegend=False, margin=dict(l=0,r=0,t=10,b=0),
+                              xaxis=dict(gridcolor="#21262d"), yaxis=dict(gridcolor="#21262d"),
+                              font=dict(color="#c9d1d9"))
+            st.plotly_chart(fig, use_container_width=True)
+
+# ─────────────────────────────────────────────
+#  PAGE: TASK BOARD
+# ─────────────────────────────────────────────
+elif page == "📋 Task Board":
+    st.markdown('<div class="page-title">Task Board</div>', unsafe_allow_html=True)
+
+    df = load_tasks(
+        status_filter   = st.session_state.get("f_status"),
+        category_filter = st.session_state.get("f_category"),
+        priority_filter = st.session_state.get("f_priority"),
+        search          = st.session_state.get("f_search", ""),
+    )
+
+    if df.empty:
+        st.markdown('<div style="color:#6e7681;padding:12px 0">No tasks match your filters.</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div style="color:#6e7681;font-size:.82rem;margin-bottom:12px">{len(df)} task{"s" if len(df)!=1 else ""} shown</div>', unsafe_allow_html=True)
+        conn = get_conn()
+        for _, row in df.iterrows():
+            dl   = pd.to_datetime(row["deadline_date"]).date()
+            diff = (dl - date.today()).days
+            cls  = "done" if row["status"] in ("Completed","Cancelled") else \
+                   "overdue" if diff < 0 else "due-soon" if diff <= 2 else "ok"
+            time_str   = f" @ {row['deadline_time']}" if row.get("deadline_time") else ""
+            client_str = f"👤 {row['client']} &nbsp;·&nbsp;" if row.get("client") else ""
+            rem_html   = f'<span class="reminder-pill">🔔 {row["reminder_datetime"]}</span>' if row.get("reminder_datetime") else ""
+            notes_html = f'<div class="task-notes">📝 {row["notes"]}</div>' if row.get("notes") else ""
+
+            st.markdown(f"""
+            <div class="task-card {cls}">
+              <div class="task-title">#{row["id"]} — {row["task_name"]}</div>
+              <div class="task-meta">
+                {priority_badge(row["priority"])} &nbsp; {status_badge(row["status"])}
+                &nbsp;&nbsp; {client_str}📁 {row["category"]}
+                &nbsp;·&nbsp; 📅 {dl.strftime("%b %d, %Y")}{time_str} ({days_label(dl)})
+                {"&nbsp;&nbsp;" + rem_html if rem_html else ""}
+              </div>
+              {notes_html}
+            </div>""", unsafe_allow_html=True)
+
+            if row["status"] not in ("Completed","Cancelled"):
+                ca, cb, _ = st.columns([1,1,6])
+                if ca.button("✅ Done",   key=f"done_{row['id']}"):
+                    conn.execute("UPDATE tasks SET status='Completed', completed_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+                    conn.commit(); st.rerun()
+                if cb.button("🚫 Cancel", key=f"cancel_{row['id']}"):
+                    conn.execute("UPDATE tasks SET status='Cancelled' WHERE id=?", (row["id"],))
+                    conn.commit(); st.rerun()
+        conn.close()
+
+# ─────────────────────────────────────────────
+#  PAGE: ADD TASK
+# ─────────────────────────────────────────────
+elif page == "➕ Add Task":
+    st.markdown('<div class="page-title">Log New Task</div>', unsafe_allow_html=True)
+    CATEGORIES = get_categories()
+    PRIORITIES = get_priorities()
+
+    with st.form("add_task_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            task_name = st.text_input("Task Description *", placeholder="e.g. Prepare Q2 review for Harrington Family")
+            category  = st.selectbox("Category *", CATEGORIES)
+            priority  = st.select_slider("Priority *", options=PRIORITIES,
+                                         value=PRIORITIES[len(PRIORITIES)//2] if PRIORITIES else "Medium")
+            client    = st.selectbox("Linked Client", get_clients())
+            status    = st.selectbox("Initial Status", ["Open","In Progress","Waiting"])
+
+        with c2:
+            dl_date  = st.date_input("Deadline Date *", value=date.today() + timedelta(days=3), min_value=date.today())
+            has_time = st.checkbox("Set a specific deadline time")
+            if has_time:
+                dl_time     = st.time_input("Deadline Time", value=time(9, 0))
+                dl_time_str = dl_time.strftime("%H:%M")
+            else:
+                dl_time_str = ""
+
+            st.markdown("**🔔 Reminder**")
+            reminder_choice = st.selectbox("Quick reminder", list(REMINDER_OPTIONS.keys()))
+            use_custom_rem  = st.checkbox("Or set a custom reminder date/time")
+            if use_custom_rem:
+                cr1, cr2    = st.columns(2)
+                custom_date = cr1.date_input("Reminder Date", value=dl_date - timedelta(days=1))
+                custom_time = cr2.time_input("Reminder Time", value=time(9, 0))
+                reminder_dt = datetime.combine(custom_date, custom_time).strftime("%Y-%m-%d %H:%M")
+            else:
+                reminder_dt = compute_reminder_dt(dl_date, dl_time_str, REMINDER_OPTIONS.get(reminder_choice, ""))
+
+        notes     = st.text_area("Notes / Context", placeholder="Any relevant details, instructions, or dependencies…", height=90)
+        submitted = st.form_submit_button("⚡ Log Task", use_container_width=True)
+
+        if submitted:
+            if not task_name.strip():
+                st.error("Task description is required.")
+            else:
+                client_val = "" if client == "— None —" else client
+                conn = get_conn()
+                conn.execute("""
+                    INSERT INTO tasks (category, task_name, priority, deadline_date, deadline_time,
+                                       reminder_datetime, client, status, notes)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                """, (category, task_name.strip(), priority, dl_date.isoformat(),
+                      dl_time_str, reminder_dt, client_val, status, notes.strip()))
+                conn.commit(); conn.close()
+                st.success(
+                    f"✅ **{task_name}** logged · {priority} · Due {dl_date.strftime('%b %d')}" +
+                    (f" @ {dl_time_str}" if dl_time_str else "") +
+                    (f" · 🔔 Reminder: {reminder_dt}" if reminder_dt else "")
+                )
+
+# ─────────────────────────────────────────────
+#  PAGE: EDIT TASK
+# ─────────────────────────────────────────────
+elif page == "✏️ Edit Task":
+    st.markdown('<div class="page-title">Edit Task</div>', unsafe_allow_html=True)
+    CATEGORIES = get_categories()
+    PRIORITIES = get_priorities()
+
+    conn      = get_conn()
+    all_tasks = pd.read_sql_query("SELECT id, task_name, status, priority FROM tasks ORDER BY id DESC", conn)
+    conn.close()
+
+    if all_tasks.empty:
+        st.info("No tasks yet.")
+    else:
+        task_options   = {f"#{r['id']} — {r['task_name']} [{r['status']}]": r["id"] for _, r in all_tasks.iterrows()}
+        selected_label = st.selectbox("Select task to edit", list(task_options.keys()))
+        task_id        = task_options[selected_label]
+
+        conn = get_conn()
+        row  = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+        conn.close()
+
+        with st.form("edit_form"):
+            c1, c2 = st.columns(2)
+            new_name     = c1.text_input("Task Description", value=row["task_name"])
+            new_category = c1.selectbox("Category", CATEGORIES,
+                           index=CATEGORIES.index(row["category"]) if row["category"] in CATEGORIES else 0)
+            new_priority = c1.select_slider("Priority", PRIORITIES,
+                           value=row["priority"] if row["priority"] in PRIORITIES else PRIORITIES[0])
+            clients_list = get_clients()
+            client_idx   = clients_list.index(row["client"]) if row.get("client") and row["client"] in clients_list else 0
+            new_client   = c1.selectbox("Linked Client", clients_list, index=client_idx)
+            new_status   = c1.selectbox("Status", STATUSES,
+                           index=STATUSES.index(row["status"]) if row["status"] in STATUSES else 0)
+
+            new_deadline = c2.date_input("Deadline Date", value=pd.to_datetime(row["deadline_date"]).date())
+            existing_time = row.get("deadline_time","")
+            has_time     = c2.checkbox("Has specific time", value=bool(existing_time))
+            if has_time:
+                try:    t_val = datetime.strptime(existing_time, "%H:%M").time()
+                except: t_val = time(9, 0)
+                new_time_str = c2.time_input("Deadline Time", value=t_val).strftime("%H:%M")
+            else:
+                new_time_str = ""
+
+            st.markdown("**🔔 Reminder**")
+            existing_rem  = row.get("reminder_datetime","")
+            use_custom_rem= st.checkbox("Set custom reminder", value=bool(existing_rem))
+            rm1, rm2      = st.columns(2)
+            if use_custom_rem:
+                try:    rem_def = datetime.strptime(existing_rem, "%Y-%m-%d %H:%M")
+                except: rem_def = datetime.now() + timedelta(hours=1)
+                rem_date    = rm1.date_input("Reminder Date", value=rem_def.date())
+                rem_t       = rm2.time_input("Reminder Time", value=rem_def.time())
+                new_rem_str = datetime.combine(rem_date, rem_t).strftime("%Y-%m-%d %H:%M")
+            else:
+                quick_rem   = rm1.selectbox("Quick remind", list(REMINDER_OPTIONS.keys()))
+                new_rem_str = compute_reminder_dt(new_deadline, new_time_str, REMINDER_OPTIONS.get(quick_rem,""))
+
+            new_notes = st.text_area("Notes", value=row.get("notes",""), height=100)
+
+            if st.form_submit_button("💾 Save Changes", use_container_width=True):
+                client_val = "" if new_client == "— None —" else new_client
+                conn = get_conn()
+                conn.execute("""
+                    UPDATE tasks SET task_name=?, category=?, priority=?, deadline_date=?,
+                    deadline_time=?, reminder_datetime=?, client=?, status=?, notes=?,
+                    completed_at = CASE WHEN ? = 'Completed' AND status != 'Completed'
+                                        THEN CURRENT_TIMESTAMP ELSE completed_at END
+                    WHERE id=?
+                """, (new_name, new_category, new_priority, new_deadline.isoformat(),
+                      new_time_str, new_rem_str, client_val, new_status, new_notes, new_status, task_id))
+                conn.commit(); conn.close()
+                st.success("Task updated."); st.rerun()
+
+        st.markdown("---")
+        if st.button("🗑️ Delete this task permanently"):
+            conn = get_conn()
+            conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+            conn.commit(); conn.close()
+            st.warning("Task deleted."); st.rerun()
+
+# ─────────────────────────────────────────────
+#  PAGE: ANALYTICS
+# ─────────────────────────────────────────────
+elif page == "📈 Analytics":
+    st.markdown('<div class="page-title">Analytics</div>', unsafe_allow_html=True)
+    df = load_tasks()
+
+    if df.empty:
+        st.info("No task data yet.")
+    else:
+        df["deadline_date"] = pd.to_datetime(df["deadline_date"])
+        df["created_at"]    = pd.to_datetime(df["created_at"])
+
+        r1, r2 = st.columns(2)
+        sc      = df.groupby("status").size().reset_index(name="count")
+        fig_pie = px.pie(sc, names="status", values="count", color="status",
+                         color_discrete_map=STATUS_COLORS, hole=0.45,
+                         template="plotly_dark", title="Tasks by Status")
+        fig_pie.update_layout(paper_bgcolor="#161b22", font=dict(color="#c9d1d9"))
+        r1.plotly_chart(fig_pie, use_container_width=True)
+
+        pc      = df.groupby("priority").size().reset_index(name="count")
+        fig_pri = px.bar(pc, x="priority", y="count", color="priority",
+                         color_discrete_map=PRIORITY_COLORS, template="plotly_dark", title="Tasks by Priority")
+        fig_pri.update_layout(paper_bgcolor="#161b22", plot_bgcolor="#161b22",
+                              showlegend=False, font=dict(color="#c9d1d9"))
+        r2.plotly_chart(fig_pri, use_container_width=True)
+
+        done = df[df["status"]=="Completed"].copy()
+        if not done.empty:
+            done["week"] = done["created_at"].dt.to_period("W").apply(lambda r: r.start_time)
+            w = done.groupby("week").size().reset_index(name="completed")
+            fig_l = px.line(w, x="week", y="completed", markers=True,
+                            template="plotly_dark", title="Completed Over Time",
+                            color_discrete_sequence=["#58a6ff"])
+            fig_l.update_layout(paper_bgcolor="#161b22", plot_bgcolor="#161b22", font=dict(color="#c9d1d9"))
+            st.plotly_chart(fig_l, use_container_width=True)
+
+        overdue_df = df[df["status"].isin(["Open","In Progress","Waiting"]) &
+                        (df["deadline_date"].dt.date < date.today())]
+        if not overdue_df.empty:
+            oc     = overdue_df.groupby("category").size().reset_index(name="count")
+            fig_od = px.bar(oc, x="category", y="count", template="plotly_dark",
+                            title="⚠️ Overdue by Category", color_discrete_sequence=["#ef4444"])
+            fig_od.update_layout(paper_bgcolor="#161b22", plot_bgcolor="#161b22",
+                                 showlegend=False, font=dict(color="#c9d1d9"))
+            st.plotly_chart(fig_od, use_container_width=True)
+
+        st.markdown('<div class="section-header">Export</div>', unsafe_allow_html=True)
+        st.download_button("⬇️ Export to CSV", df.to_csv(index=False).encode("utf-8"),
+                           "tasks_export.csv", "text/csv")
+
+# ─────────────────────────────────────────────
+#  PAGE: CLIENTS
+# ─────────────────────────────────────────────
+elif page == "👥 Clients":
+    st.markdown('<div class="page-title">Client Roster</div>', unsafe_allow_html=True)
+
+    conn       = get_conn()
+    clients_df = pd.read_sql_query("SELECT * FROM clients ORDER BY name", conn)
+
+    if clients_df.empty:
+        st.info("No clients yet. Add one below.")
+    else:
+        for _, c in clients_df.iterrows():
+            header = f"👤  {c['name']}" + (f"  ·  {c['company']}" if c.get("company") else "")
+            with st.expander(header, expanded=False):
+                with st.form(f"edit_client_{c['id']}"):
+                    ec1, ec2 = st.columns(2)
+                    new_name    = ec1.text_input("Name *",           value=c["name"])
+                    new_company = ec1.text_input("Company / Entity", value=c.get("company",""))
+                    new_advisor = ec1.text_input("Advisor",          value=c.get("advisor",""))
+                    new_phone   = ec2.text_input("Phone",            value=c.get("phone",""))
+                    new_email   = ec2.text_input("Email",            value=c.get("email",""))
+                    new_notes   = st.text_area("Notes",              value=c.get("notes",""), height=80)
+
+                    s1, s2 = st.columns(2)
+                    save_c = s1.form_submit_button("💾 Save Changes",        use_container_width=True)
+                    del_c  = s2.form_submit_button("🗑️ Delete Client",       use_container_width=True)
+
+                    if save_c:
+                        if not new_name.strip():
+                            st.error("Name is required.")
+                        else:
+                            conn.execute("""UPDATE clients SET name=?,company=?,advisor=?,phone=?,email=?,notes=?
+                                           WHERE id=?""",
+                                         (new_name.strip(), new_company, new_advisor, new_phone, new_email, new_notes, c["id"]))
+                            conn.commit(); st.success("Client updated."); st.rerun()
+
+                    if del_c:
+                        conn.execute("DELETE FROM clients WHERE id=?", (c["id"],))
+                        conn.commit(); st.warning(f"Client '{c['name']}' deleted."); st.rerun()
+
+                # Linked open tasks
+                linked = pd.read_sql_query(
+                    "SELECT task_name, priority, status, deadline_date FROM tasks WHERE client=? AND status NOT IN ('Completed','Cancelled') ORDER BY deadline_date",
+                    conn, params=(c["name"],)
+                )
+                if not linked.empty:
+                    st.markdown(f'<div style="font-size:.8rem;color:#6e7681;margin-top:10px;margin-bottom:4px">{len(linked)} open task{"s" if len(linked)>1 else ""}</div>', unsafe_allow_html=True)
+                    for _, t in linked.iterrows():
+                        st.markdown(f'<div style="font-size:.82rem;color:#c9d1d9;padding:3px 0">→ {t["task_name"]} &nbsp; {priority_badge(t["priority"])} &nbsp; <span style="color:#6e7681">{t["deadline_date"]}</span></div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-header">Add New Client</div>', unsafe_allow_html=True)
+    with st.form("add_client"):
+        nc1, nc2 = st.columns(2)
+        add_name    = nc1.text_input("Name *")
+        add_company = nc1.text_input("Company / Entity")
+        add_advisor = nc1.text_input("Advisor", value="You")
+        add_phone   = nc2.text_input("Phone")
+        add_email   = nc2.text_input("Email")
+        add_notes   = st.text_area("Notes", height=70)
+
+        if st.form_submit_button("➕ Add Client", use_container_width=True):
+            if add_name.strip():
+                try:
+                    conn.execute("INSERT INTO clients (name,company,advisor,phone,email,notes) VALUES (?,?,?,?,?,?)",
+                                 (add_name.strip(), add_company, add_advisor, add_phone, add_email, add_notes))
+                    conn.commit(); st.success(f"Client **{add_name}** added."); st.rerun()
+                except Exception:
+                    st.error("A client with that name already exists.")
+            else:
+                st.error("Name is required.")
+    conn.close()
+
+# ─────────────────────────────────────────────
+#  PAGE: SETTINGS
+# ─────────────────────────────────────────────
+elif page == "⚙️ Settings":
+    st.markdown('<div class="page-title">Settings</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-header">📊 Dashboard Layout</div>', unsafe_allow_html=True)
+    d1, d2 = st.columns(2)
+    with d1:
+        urgency_days = st.number_input("Show tasks due within N days", min_value=1, max_value=30,
+                                       value=int(get_setting("dash_urgency_days","3")))
+        max_cards    = st.number_input("Max task cards on dashboard",  min_value=1, max_value=50,
+                                       value=int(get_setting("dash_max_cards","8")))
+    with d2:
+        show_chart     = st.checkbox("Show pipeline chart",       value=get_setting("dash_show_chart")    =="true")
+        show_reminders = st.checkbox("Show reminders panel",      value=get_setting("dash_show_reminders")=="true")
+        show_overdue   = st.checkbox("Show overdue in feed",      value=get_setting("dash_show_overdue")  =="true")
+        show_today     = st.checkbox("Show today's tasks in feed",value=get_setting("dash_show_today")    =="true")
+
+    st.markdown("**Metric tiles:**")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    tile_open     = m1.checkbox("Open",       value=get_setting("dash_metric_open")     =="true")
+    tile_critical = m2.checkbox("Critical",   value=get_setting("dash_metric_critical") =="true")
+    tile_overdue  = m3.checkbox("Overdue",    value=get_setting("dash_metric_overdue")  =="true")
+    tile_closed   = m4.checkbox("Closed/Wk", value=get_setting("dash_metric_closed")   =="true")
+    tile_rem      = m5.checkbox("Reminders",  value=get_setting("dash_metric_reminders")=="true")
+
+    st.markdown('<div class="section-header">📋 Task Customization</div>', unsafe_allow_html=True)
+    t1, t2 = st.columns(2)
+    with t1:
+        try:    cats_default = "\n".join(json.loads(get_setting("task_categories")))
+        except: cats_default = "General"
+        cats_text = st.text_area("Task Categories (one per line)", value=cats_default, height=200)
+    with t2:
+        try:    pris_default = "\n".join(json.loads(get_setting("priority_levels")))
+        except: pris_default = "Low\nMedium\nHigh\nCritical"
+        pris_text = st.text_area("Priority Levels — lowest → highest (one per line)", value=pris_default, height=200)
+
+    st.markdown("")
+    if st.button("💾 Save All Settings", use_container_width=True):
+        set_setting("dash_urgency_days",     str(urgency_days))
+        set_setting("dash_max_cards",        str(max_cards))
+        set_setting("dash_show_chart",       "true" if show_chart     else "false")
+        set_setting("dash_show_reminders",   "true" if show_reminders else "false")
+        set_setting("dash_show_overdue",     "true" if show_overdue   else "false")
+        set_setting("dash_show_today",       "true" if show_today     else "false")
+        set_setting("dash_metric_open",      "true" if tile_open      else "false")
+        set_setting("dash_metric_critical",  "true" if tile_critical  else "false")
+        set_setting("dash_metric_overdue",   "true" if tile_overdue   else "false")
+        set_setting("dash_metric_closed",    "true" if tile_closed    else "false")
+        set_setting("dash_metric_reminders", "true" if tile_rem       else "false")
+
+        new_cats = [x.strip() for x in cats_text.strip().splitlines() if x.strip()]
+        new_pris = [x.strip() for x in pris_text.strip().splitlines() if x.strip()]
+        if new_cats: set_setting("task_categories", json.dumps(new_cats))
+        if new_pris: set_setting("priority_levels",  json.dumps(new_pris))
+
+        st.success("✅ Settings saved.")
