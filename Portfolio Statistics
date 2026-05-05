@@ -1,0 +1,152 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+
+# ----- DATA INPUTS (EXACT QUANTITIES) -----
+
+Portfolio = {
+    'VOO': 6.965, 'MSFT': 5.002, 'HOOD': 22.0, 'QQQ': 4.761, 'AMZN': 6.328,
+    'IBIT': 20.0, 'SNOW': 3.0, 'INTU': 1.0, 'WDAY': 3.217, 'VOOG': 1.0,
+    'SOXX': 0.811, 'JEPI': 4.77, 'ETHV': 8.0, 'ADBE': 1.0, 'TTWO': 1.0,
+    'QQQM': 0.652, 'LLY': 0.163, 'CME': 0.377, 'VB': 0.424, 'NVDA': 0.293,
+    'XLP': 0.35, 'U': 1.0, 'GBDC': 1.667
+}
+
+# ----- FIXED ENGINE SETUP -----
+def get_full_analysis():
+    all_tickers = list(set().union(RothPortfolio.keys(), Brokerage.keys()))
+    benchmarks = ["^GSPC", "^NDX"]
+    all_symbols = all_tickers + benchmarks
+    
+    print("🚀 Running Full Diagnostic... Handling MultiIndex Data.")
+    
+    # Fetch 1 Year of Data
+    data = yf.download(all_symbols, period="1y", interval="1d", progress=False)
+    
+    # FIX: Use 'Close' instead of 'Adj Close' and handle the MultiIndex correctly
+    # We use .xs to 'cross-section' the data to get only the Close prices for all tickers
+    if isinstance(data.columns, pd.MultiIndex):
+        adj_close = data.xs('Close', axis=1, level=0 if 'Close' in data.columns.levels[0] else 1).ffill()
+    else:
+        adj_close = data['Close'].ffill()
+    
+    # Fetch Fundamental Metadata
+    meta = []
+    for t in all_tickers:
+        try:
+            # We use a smaller timeout to prevent hanging
+            info = yf.Ticker(t).info
+            meta.append({
+                'Ticker': t, 
+                'Sector': info.get('sector', 'ETF/Crypto'), 
+                'Beta': info.get('beta', 1.0), 
+                'PE': info.get('forwardPE', np.nan)
+            })
+        except:
+            meta.append({'Ticker': t, 'Sector': 'Unknown', 'Beta': 1.0, 'PE': np.nan})
+            
+    meta_df = pd.DataFrame(meta).set_index('Ticker')
+
+    # Quick Benchmark Info
+    try:
+        spy_pe = yf.Ticker("SPY").info.get('forwardPE', 21.5)
+        qqq_pe = yf.Ticker("QQQ").info.get('forwardPE', 28.3)
+    except:
+        spy_pe, qqq_pe = 21.5, 28.3
+
+    return adj_close, meta_df, benchmarks, spy_pe, qqq_pe
+
+# ----- COMPUTE METRICS (Keep the rest of your logic) -----
+adj_close, meta_df, benchmarks, spy_pe, qqq_pe = get_full_analysis()
+
+def process_account(name, portfolio, prices, meta):
+    shares = pd.Series(portfolio)
+    daily_val = (prices[shares.index] * shares).sum(axis=1)
+    returns = daily_val.pct_change().dropna()
+    
+    # Weights for fundamentals
+    current_val = (prices[shares.index].iloc[-1] * shares)
+    weights = current_val / current_val.sum()
+    
+    avg_beta = (meta.loc[shares.index, 'Beta'] * weights).sum()
+    avg_pe = (meta.loc[shares.index, 'PE'] * weights).dropna().sum()
+    
+    # Sharpe (Risk Free Rate assumed 4%)
+    sharpe = (returns.mean() * 252 - 0.04) / (returns.std() * np.sqrt(252))
+    
+    # Drawdown
+    cum_rets = (1 + returns).cumprod()
+    peak = cum_rets.cummax()
+    dd = (cum_rets - peak) / peak
+    
+    return {
+        'name': name, 'daily_val': daily_val, 'returns': returns, 
+        'beta': avg_beta, 'pe': avg_pe, 'sharpe': sharpe, 'dd': dd, 'total': daily_val.iloc[-1]
+    }
+
+# Process All 3 Views
+roth = process_account("Roth IRA", RothPortfolio, adj_close, meta_df)
+broker = process_account("Individual", Brokerage, adj_close, meta_df)
+combined_dict = {k: RothPortfolio.get(k, 0) + Brokerage.get(k, 0) for k in set(RothPortfolio) | set(Brokerage)}
+comb = process_account("Combined", combined_dict, adj_close, meta_df)
+
+# Benchmark Returns
+bench_rets = adj_close[benchmarks].pct_change().dropna()
+
+# ----- PLOTTING -----
+plt.style.use('dark_background')
+fig = plt.figure(figsize=(20, 14))
+
+# 1. TIME SERIES: Performance vs Benchmarks
+ax1 = plt.subplot2grid((3, 2), (0, 0))
+for acc in [roth, broker, comb]:
+    (1 + acc['returns']).cumprod().plot(ax=ax1, label=acc['name'], lw=2)
+(1 + bench_rets).cumprod().plot(ax=ax1, alpha=0.5, linestyle='--')
+ax1.set_title("Performance Comparison (Cumulative Returns)")
+ax1.legend()
+
+# 2. TIME SERIES: Valuation (Proxying NTM P/E over time based on price movement)
+# Note: Real NTM P/E is a point-in-time; this chart shows valuation drift relative to start
+ax2 = plt.subplot2grid((3, 2), (0, 1))
+for acc in [roth, broker, comb]:
+    pe_series = (acc['daily_val'] / acc['daily_val'].iloc[0]) * acc['pe']
+    pe_series.plot(ax=ax2, label=f"{acc['name']} Drift")
+ax2.axhline(spy_pe, color='white', linestyle=':', label='SPY Target PE')
+ax2.axhline(qqq_pe, color='cyan', linestyle=':', label='QQQ Target PE')
+ax2.set_title("Valuation (P/E) Time-Series Drift")
+ax2.legend()
+
+# 3. DRAWDOWN: Risk Exposure
+ax3 = plt.subplot2grid((3, 2), (1, 0))
+for acc in [roth, broker, comb]:
+    acc['dd'].plot(ax=ax3, label=acc['name'], alpha=0.7)
+ax3.set_title("Drawdown Analysis (Under Water %)")
+ax3.fill_between(comb['dd'].index, comb['dd'], color='red', alpha=0.1)
+
+# 4. ANALYTICS TABLE (Simulated on plot)
+ax4 = plt.subplot2grid((3, 2), (1, 1))
+ax4.axis('off')
+stats_text = "PORTFOLIO STATS\n" + "="*20 + "\n"
+for a in [roth, broker, comb]:
+    stats_text += f"{a['name'].upper()}:\n Value: ${a['total']:,.2f}\n Beta: {a['beta']:.2f}\n Sharpe: {a['sharpe']:.2f}\n P/E: {a['pe']:.1f}x\n Max DD: {a['dd'].min()*100:.1f}%\n\n"
+ax4.text(0.1, 0.5, stats_text, fontsize=12, family='monospace', verticalalignment='center')
+
+# 5. RISK-REWARD SCATTER
+ax5 = plt.subplot2grid((3, 2), (2, 0), colspan=2)
+for a in [roth, broker, comb]:
+    ax5.scatter(a['returns'].std() * np.sqrt(252), a['returns'].mean() * 252, s=200, label=a['name'])
+# Benchmarks on scatter
+for b in benchmarks:
+    ax5.scatter(bench_rets[b].std() * np.sqrt(252), bench_rets[b].mean() * 252, s=100, marker='x', label=b)
+ax5.set_xlabel("Volatility (Risk)")
+ax5.set_ylabel("Annualized Return")
+ax5.set_title("Risk vs. Reward (Efficient Frontier Position)")
+ax5.legend()
+
+plt.tight_layout()
+plt.show()
+
+print(f"\n✅ Analysis Complete. Individual Account Beta: {broker['beta']:.2f} | Roth Account Beta: {roth['beta']:.2f}")
