@@ -1,0 +1,1877 @@
+#!/usr/bin/env python3
+"""
+=============================================================================
+  SPY PUT SPREAD STRATEGY — FIXED PARAMETER BACKTEST & ANALYTICS
+=============================================================================
+  Parameters (fixed, no optimization):
+    Entry day     : 8th trading day of each month
+    Min VIX       : 14  (skip month if VIX < 14)
+    Short put OTM : 11% below spot  → K_short = spot × 0.89
+    Long  put OTM : 18% below spot  → K_long  = spot × 0.82
+    Stop loss     : 90% of max loss (close MTM if loss ≥ 0.90 × width)
+    Expiry        : exactly 1 calendar month after entry
+
+  Capital structure:
+    Cash                    : $1,500   (100% margin eligible)
+    SPY shares (fixed count): $15,000 worth at inception (25% margin eligible)
+    Buying power            = cash × 1.00 + spy_market_value × 0.25
+    Contracts               = floor(buying_power / (max_loss_per_share × 100))
+
+  P&L accounting:
+    • Premium collected credited to cash at trade open
+    • At expiry (or stop): settlement debited/credited from cash
+    • SPY share count never changes — only market value floats with price
+    • After each exit, new buying power = updated cash + spy mark × 0.25
+
+  Option pricing:
+    Black-Scholes puts with parameterised vol-skew:
+      σ(K) = σ_ATM × (1 + 0.45·ln(S/K) + 0.15·ln(S/K)²)
+    ATM vol proxy = VIX / 100
+    Risk-free rate = piecewise-constant Fed Funds approximation
+=============================================================================
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPORTS
+# ─────────────────────────────────────────────────────────────────────────────
+import os, sys, warnings
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from scipy.stats import norm
+from dateutil.relativedelta import relativedelta
+
+import matplotlib
+try:
+    from IPython import get_ipython as _gip
+    _ipy = _gip()
+    IN_JUPYTER = _ipy is not None and "IPKernelApp" in _ipy.config
+except Exception:
+    IN_JUPYTER = False
+
+if not IN_JUPYTER:
+    matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from matplotlib.colors import LinearSegmentedColormap
+import seaborn as sns
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+try:
+    from IPython.display import display as _disp, HTML as _HTML, Image as _Img
+    DISP_OK = True
+except ImportError:
+    DISP_OK = False
+
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRATEGY PARAMETERS  ← edit here
+# ─────────────────────────────────────────────────────────────────────────────
+TRADE_DAY       = 8      # nth trading day of month to open
+MIN_VIX         = 14     # skip month if VIX below this
+SHORT_PUT_OTM   = 11.0   # short put = spot × (1 - 11/100)
+LONG_PUT_OTM    = 18.0   # long  put = spot × (1 - 18/100)
+STOP_LOSS_PCT   = 90.0   # close if MTM loss ≥ 90% of max loss
+
+# Capital
+INITIAL_CASH        = 1_500.0
+INITIAL_SPY_VALUE   = 15_000.0
+CASH_MARGIN         = 1.00      # 100% of cash is margin
+SECURITIES_MARGIN   = 0.25      # 25%  of SPY value is margin
+CONTRACT_SIZE       = 100       # shares per contract
+
+# Vol skew
+SKEW_SLOPE      = 0.45
+SKEW_CONVEXITY  = 0.15
+
+# Output
+OUT_DIR = "spy_strategy_output"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISPLAY HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+C = dict(
+    win="#2ECC71", loss="#E74C3C", neutral="#3498DB",
+    spy="#F39C12", port="#9B59B6", vix="#95A5A6",
+    teal="#14B8A6", gold="#F59E0B",
+    bg="#0D1117", panel="#111827", grid="#1C2333",
+    text="#E5E7EB", sub="#9CA3AF", border="#374151",
+)
+
+plt.rcParams.update({
+    "figure.facecolor": C["bg"],   "axes.facecolor":  C["panel"],
+    "axes.edgecolor":   C["border"],"axes.labelcolor": C["text"],
+    "axes.titlecolor":  C["text"], "xtick.color":     C["sub"],
+    "ytick.color":      C["sub"],  "text.color":      C["text"],
+    "grid.color":       C["grid"], "grid.linestyle":  "--",
+    "grid.alpha":       0.45,      "legend.facecolor":C["panel"],
+    "legend.edgecolor": C["border"],"font.family":    "monospace",
+    "figure.dpi":       130,
+})
+
+def _hdr(txt):
+    if IN_JUPYTER and DISP_OK:
+        _disp(_HTML(
+            f"<hr style='border:1px solid #374151;margin:20px 0 6px'>"
+            f"<h3 style='color:#9B59B6;font-family:monospace;margin:0 0 2px'>{txt}</h3>"
+        ))
+    else:
+        print(f"\n{'─'*60}\n  {txt}\n{'─'*60}")
+
+def _show(fig, fname):
+    path = f"{OUT_DIR}/{fname}"
+    fig.savefig(path, dpi=140, bbox_inches="tight", facecolor=C["bg"])
+    if IN_JUPYTER and DISP_OK:
+        _disp(_Img(filename=path))
+    else:
+        plt.show()
+    plt.close(fig)
+
+def _showly(fig, fname):
+    path = f"{OUT_DIR}/{fname}"
+    fig.update_layout(template="plotly_dark",
+                      margin=dict(l=55, r=30, t=60, b=45))
+    fig.write_html(path)
+    if IN_JUPYTER and DISP_OK:
+        _disp(_HTML(fig.to_html(full_html=False, include_plotlyjs="cdn")))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — MARKET DATA
+# ─────────────────────────────────────────────────────────────────────────────
+def _risk_free(dates):
+    rates = pd.Series(np.nan, index=dates)
+    table = [
+        ("1993-01-01","1994-02-01",0.030),("1994-02-01","1995-07-01",0.060),
+        ("1995-07-01","1999-06-01",0.053),("1999-06-01","2001-01-01",0.065),
+        ("2001-01-01","2003-07-01",0.020),("2003-07-01","2004-07-01",0.010),
+        ("2004-07-01","2007-09-01",0.053),("2007-09-01","2009-01-01",0.020),
+        ("2009-01-01","2015-12-01",0.002),("2015-12-01","2018-01-01",0.013),
+        ("2018-01-01","2020-03-15",0.025),("2020-03-15","2022-03-15",0.001),
+        ("2022-03-15","2023-08-01",0.050),("2023-08-01","2099-01-01",0.053),
+    ]
+    for s, e, r in table:
+        rates.loc[(dates >= s) & (dates < e)] = r
+    return rates.fillna(0.04)
+
+def fetch_data(start="1993-01-29"):
+    print("  Downloading SPY …")
+    spy = yf.download("SPY",  start=start, auto_adjust=True, progress=False)
+    print("  Downloading ^VIX …")
+    vix = yf.download("^VIX", start=start, auto_adjust=True, progress=False)
+    df = pd.DataFrame({
+        "spy": spy["Close"].squeeze(),
+        "vix": vix["Close"].squeeze(),
+    }).dropna()
+    df["rf"] = _risk_free(df.index)
+    print(f"  {len(df):,} trading days  "
+          f"({df.index[0].date()} → {df.index[-1].date()})\n")
+    return df
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — BLACK-SCHOLES + SKEW
+# ─────────────────────────────────────────────────────────────────────────────
+def _bs_put(S, K, T, r, sigma):
+    if T < 1e-6 or sigma < 1e-6:
+        return max(K - S, 0.0)
+    d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    return float(max(K*np.exp(-r*T)*norm.cdf(-d2) - S*norm.cdf(-d1), 0.0))
+
+def _skew_sigma(S, K, atm):
+    lm = np.log(S/K)
+    return atm * max(1 + SKEW_SLOPE*lm + SKEW_CONVEXITY*lm**2, 0.01)
+
+def _price_spread(S, K_s, K_l, T, r, atm):
+    """Price the put spread. Returns dict with all pricing detail."""
+    sig_s = _skew_sigma(S, K_s, atm)
+    sig_l = _skew_sigma(S, K_l, atm)
+    p_s   = _bs_put(S, K_s, T, r, sig_s)
+    p_l   = _bs_put(S, K_l, T, r, sig_l)
+    prem  = p_s - p_l          # net credit per share (positive = credit received)
+    width = K_s - K_l          # spread width per share
+    return dict(
+        premium   = prem,
+        max_loss  = width - prem,   # worst-case loss per share (positive number)
+        width     = width,
+        p_short   = p_s,
+        p_long    = p_l,
+        sig_short = sig_s,
+        sig_long  = sig_l,
+    )
+
+def _pnl_expiry(S_exp, K_s, K_l, prem):
+    """
+    Realised P&L per share at expiry.
+    Full profit  (=+prem)          if S_exp >= K_s
+    Full loss    (=-(width-prem))  if S_exp <= K_l
+    Linear in between.
+    """
+    cost = max(K_s - S_exp, 0.0) - max(K_l - S_exp, 0.0)
+    return prem - cost
+
+def _mtm_pnl(S, K_s, K_l, T_rem, r, atm, entry_prem):
+    """Mark-to-market P&L per share on an open spread (positive = unrealised gain)."""
+    sp = _price_spread(S, K_s, K_l, T_rem, r, atm)
+    return entry_prem - sp["premium"]   # debit to close vs credit received
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — BACKTEST ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+def run_backtest(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Run the fixed-parameter put spread backtest.
+
+    Returns
+    -------
+    trades    : one row per completed trade
+    portfolio : daily portfolio timeseries
+    """
+
+    spy   = df["spy"].to_numpy(dtype=np.float64)
+    vix   = df["vix"].to_numpy(dtype=np.float64)
+    rf    = df["rf"].to_numpy(dtype=np.float64)
+    dates = df.index
+    n     = len(df)
+
+    # Pre-build month → sorted list of row indices
+    ym_idx: dict[tuple, list[int]] = {}
+    for i, dt in enumerate(dates):
+        ym_idx.setdefault((dt.year, dt.month), []).append(i)
+
+    def nth_idx(yr, mo, nth):
+        g = ym_idx.get((yr, mo), [])
+        return g[nth - 1] if len(g) >= nth else None
+
+    def expiry_idx(entry_i):
+        target = dates[entry_i] + relativedelta(months=1)
+        pos    = dates.searchsorted(target)
+        return int(pos) if pos < n else None
+
+    # ── State ────────────────────────────────────────────────────────────────
+    spy_shares = INITIAL_SPY_VALUE / spy[0]
+    cash       = INITIAL_CASH
+
+    trades         = []
+    active         = None
+    months_opened  = set()
+    sl_thresh      = STOP_LOSS_PCT / 100.0
+
+    for i in range(n):
+        S   = spy[i]
+        v   = vix[i]
+        r   = rf[i]
+        dt  = dates[i]
+
+        # ── A) Manage open trade ───────────────────────────────────────────
+        if active:
+            exp_i = active["exp_i"]
+
+            # ── Expiry ────────────────────────────────────────────────────
+            if i >= exp_i:
+                pnl_ps    = _pnl_expiry(S, active["K_s"], active["K_l"], active["prem"])
+                total_pnl = pnl_ps * CONTRACT_SIZE * active["n_contracts"]
+                cash     += total_pnl
+
+                active.update(
+                    exit_date   = dt,
+                    exit_spy    = S,
+                    exit_reason = "expiry",
+                    pnl_ps      = pnl_ps,
+                    total_pnl   = total_pnl,
+                    cash_after  = cash,
+                    spy_value_exit = spy_shares * S,
+                    total_value_exit = cash + spy_shares * S,
+                )
+                trades.append(active)
+                active = None
+
+            # ── Stop-loss check ───────────────────────────────────────────
+            else:
+                T_rem = max((dates[exp_i] - dt).days / 365.0, 1e-6)
+                mtm   = _mtm_pnl(S, active["K_s"], active["K_l"],
+                                  T_rem, r, v / 100.0, active["prem"])
+                # mtm negative = losing money
+                if -mtm >= sl_thresh * active["max_loss_ps"]:
+                    total_pnl = mtm * CONTRACT_SIZE * active["n_contracts"]
+                    cash     += total_pnl
+
+                    active.update(
+                        exit_date   = dt,
+                        exit_spy    = S,
+                        exit_reason = "stop_loss",
+                        pnl_ps      = mtm,
+                        total_pnl   = total_pnl,
+                        cash_after  = cash,
+                        spy_value_exit = spy_shares * S,
+                        total_value_exit = cash + spy_shares * S,
+                    )
+                    trades.append(active)
+                    active = None
+
+        # ── B) Open new trade ─────────────────────────────────────────────
+        ym = (dt.year, dt.month)
+        if not active and ym not in months_opened:
+            entry_i = nth_idx(dt.year, dt.month, TRADE_DAY)
+            if entry_i == i:
+                months_opened.add(ym)
+
+                if v < MIN_VIX:
+                    # VIX too low — skip month, record as skipped
+                    trades.append(dict(
+                        entry_date=dt, exit_date=None, exit_spy=None,
+                        K_s=None, K_l=None, prem=None, max_loss_ps=None,
+                        n_contracts=0, total_credit=0, buying_power=None,
+                        vix_entry=v, spy_entry=S,
+                        exit_reason="vix_filter", pnl_ps=0,
+                        total_pnl=0, cash_after=cash,
+                        spy_value_entry=spy_shares*S,
+                        spy_value_exit=None,
+                        total_value_entry=cash+spy_shares*S,
+                        total_value_exit=None,
+                        sig_short=None, sig_long=None, width=None,
+                    ))
+                    continue
+
+                exp_i = expiry_idx(i)
+                if exp_i is None:
+                    continue
+
+                K_s = S * (1 - SHORT_PUT_OTM / 100.0)
+                K_l = S * (1 - LONG_PUT_OTM  / 100.0)
+                T   = max((dates[exp_i] - dt).days / 365.0, 1e-6)
+                sp  = _price_spread(S, K_s, K_l, T, r, v / 100.0)
+
+                prem     = sp["premium"]
+                max_loss = sp["max_loss"]   # per share, positive number
+
+                if prem <= 0 or max_loss <= 0:
+                    continue
+
+                # ── Position sizing ───────────────────────────────────────
+                spy_val     = spy_shares * S
+                buy_power   = max(cash, 0.0) * CASH_MARGIN + spy_val * SECURITIES_MARGIN
+                n_contracts = int(buy_power / (max_loss * CONTRACT_SIZE))
+
+                if n_contracts <= 0:
+                    continue
+
+                active = dict(
+                    entry_date   = dt,
+                    exp_i        = exp_i,
+                    expiry_date  = dates[exp_i],
+                    spy_entry    = S,
+                    vix_entry    = v,
+                    K_s          = K_s,
+                    K_l          = K_l,
+                    prem         = prem,
+                    max_loss_ps  = max_loss,
+                    width        = sp["width"],
+                    sig_short    = sp["sig_short"],
+                    sig_long     = sp["sig_long"],
+                    n_contracts  = n_contracts,
+                    total_credit = prem * CONTRACT_SIZE * n_contracts,
+                    buying_power = buy_power,
+                    spy_value_entry   = spy_val,
+                    total_value_entry = cash + spy_val,
+                    cash_entry   = cash,
+                    # filled at exit:
+                    exit_date=None, exit_spy=None, exit_reason=None,
+                    pnl_ps=None, total_pnl=None, cash_after=None,
+                    spy_value_exit=None, total_value_exit=None,
+                )
+
+    # Force-close open trade at end of data
+    if active:
+        S_last = spy[-1]
+        pnl_ps = _pnl_expiry(S_last, active["K_s"], active["K_l"], active["prem"])
+        total_pnl = pnl_ps * CONTRACT_SIZE * active["n_contracts"]
+        cash     += total_pnl
+        active.update(
+            exit_date="end_of_data", exit_spy=S_last,
+            exit_reason="end_of_data", pnl_ps=pnl_ps,
+            total_pnl=total_pnl, cash_after=cash,
+            spy_value_exit=spy_shares * S_last,
+            total_value_exit=cash + spy_shares * S_last,
+        )
+        trades.append(active)
+
+    trades_df = pd.DataFrame(trades)
+
+    # ── Build cash timeseries (daily, forward-filled from exit events) ────────
+    pf = pd.DataFrame(index=dates)
+    pf["spy_price"] = spy
+    pf["spy_value"] = spy_shares * spy
+    pf["vix"]       = vix
+
+    cash_ts = np.empty(n); cash_ts[:] = np.nan; cash_ts[0] = INITIAL_CASH
+    for t in trades_df[trades_df["cash_after"].notna()].itertuples():
+        if hasattr(t, "exit_date") and t.exit_date is not None:
+            if t.exit_date in df.index:
+                cash_ts[df.index.get_loc(t.exit_date)] = t.cash_after
+
+    valid = np.where(~np.isnan(cash_ts), np.arange(n), 0)
+    np.maximum.accumulate(valid, out=valid)
+    pf["cash"]        = cash_ts[valid]
+    pf["total_value"] = pf["spy_value"] + pf["cash"]
+
+    # ── PERFORMANCE is cash-only (options P&L only, not SPY appreciation) ────
+    # Returns based purely on cash balance changes.
+    pf["returns"]     = pf["cash"].pct_change().fillna(0)
+
+    # SPY buy-and-hold normalised to INITIAL_CASH for comparison on same axis
+    pf["bah_cash_equiv"] = (spy / spy[0]) * INITIAL_CASH
+    pf["bah_returns"]    = pf["bah_cash_equiv"].pct_change().fillna(0)
+
+    # ── Monthly resampled (one point per month — last trading day) ────────────
+    pf_mo = pd.DataFrame()
+    pf_mo["cash"]          = pf["cash"].resample("ME").last()
+    pf_mo["spy_price"]     = pf["spy_price"].resample("ME").last()
+    pf_mo["spy_value"]     = pf["spy_value"].resample("ME").last()
+    pf_mo["total_value"]   = pf["total_value"].resample("ME").last()
+    pf_mo["bah_cash_equiv"]= pf["bah_cash_equiv"].resample("ME").last()
+    pf_mo["vix"]           = pf["vix"].resample("ME").last()
+    pf_mo["cash_return"]   = pf_mo["cash"].pct_change().fillna(0)
+
+    # Drawdown on monthly cash
+    cash_arr = pf_mo["cash"].values
+    peak     = np.maximum.accumulate(cash_arr)
+    pf_mo["dd"]     = (cash_arr - peak) / peak * 100
+    # SPY drawdown (same normalisation)
+    bah_arr  = pf_mo["bah_cash_equiv"].values
+    bah_peak = np.maximum.accumulate(bah_arr)
+    pf_mo["dd_bah"] = (bah_arr - bah_peak) / bah_peak * 100
+
+    # For rolling metrics use daily returns still (need enough points)
+    cum_c = np.cumprod(1 + pf["returns"].values)
+    pf["cum"] = cum_c
+    peak_c    = np.maximum.accumulate(cum_c)
+    pf["dd"]  = (cum_c - peak_c) / peak_c * 100
+
+    cum_b = np.cumprod(1 + pf["bah_returns"].values)
+    pf["dd_bah"] = (cum_b - np.maximum.accumulate(cum_b)) \
+                   / np.maximum.accumulate(cum_b) * 100
+
+    return trades_df, pf, pf_mo
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_metrics(trades_df: pd.DataFrame, pf: pd.DataFrame, pf_mo: pd.DataFrame) -> dict:
+    done = trades_df[trades_df["exit_reason"] != "vix_filter"].copy()
+    done = done[done["total_pnl"].notna()]
+    wins   = done[done["total_pnl"] >= 0]
+    losses = done[done["total_pnl"] <  0]
+
+    # All performance stats based on cash balance only
+    ret     = pf["returns"]          # daily cash pct-change
+    ann_ret = ret.mean() * 252
+    ann_vol = ret.std()  * np.sqrt(252)
+    sharpe  = ann_ret / ann_vol if ann_vol > 0 else 0
+    neg     = ret[ret < 0]
+    sortino = ann_ret / (neg.std() * np.sqrt(252)) if len(neg) > 1 else 0
+    mdd     = pf_mo["dd"].min()
+    calmar  = ann_ret / abs(mdd / 100) if mdd != 0 else 0
+
+    years   = (pf.index[-1] - pf.index[0]).days / 365.25
+    sv, fv  = pf["cash"].iloc[0], pf["cash"].iloc[-1]
+    cagr    = (fv / sv) ** (1 / years) - 1 if years > 0 and sv > 0 else 0
+    tot_ret = (fv - sv) / sv if sv > 0 else 0
+
+    avg_w = wins["total_pnl"].mean()   if len(wins)   > 0 else 0
+    avg_l = losses["total_pnl"].mean() if len(losses) > 0 else 0
+    pf_r  = (avg_w * len(wins)) / abs(avg_l * len(losses)) \
+            if avg_l != 0 and len(losses) > 0 else 0
+    n_sl  = (done["exit_reason"] == "stop_loss").sum()
+
+    return dict(
+        cagr=cagr, total_return=tot_ret, annual_return=ann_ret,
+        annual_vol=ann_vol, sharpe=sharpe, sortino=sortino,
+        calmar=calmar, max_drawdown=mdd / 100,
+        n_trades=len(done), n_wins=len(wins), n_losses=len(losses),
+        win_rate=len(wins) / len(done) if len(done) > 0 else 0,
+        avg_win=avg_w, avg_loss=avg_l, profit_factor=pf_r,
+        n_stop_loss=int(n_sl), stop_loss_rate=n_sl / len(done) if len(done) > 0 else 0,
+        total_pnl=done["total_pnl"].sum(),
+        final_cash=fv, initial_cash=sv,
+        years=years,
+        vix_skipped=int((trades_df["exit_reason"] == "vix_filter").sum()),
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 — ALL CHARTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _active(trades_df):
+    return trades_df[
+        (trades_df["exit_reason"] != "vix_filter") &
+        trades_df["total_pnl"].notna()
+    ].copy()
+
+# ── Chart 01 — Master cash equity curve (monthly points) ─────────────────────
+def chart_01_equity(pf, pf_mo, trades_df, m):
+    done = _active(trades_df)
+    wins = done[done["total_pnl"] >= 0]
+    lsss = done[done["total_pnl"] <  0]
+
+    fig, axes = plt.subplots(4, 1, figsize=(17, 22),
+                              gridspec_kw={"height_ratios": [3, 1.2, 1.2, 1]})
+    fig.suptitle(
+        f"SPY Put Spread — Cash Balance Performance (Monthly)\n"
+        f"Short {SHORT_PUT_OTM}% OTM | Long {LONG_PUT_OTM}% OTM | "
+        f"Day {TRADE_DAY} | Min VIX {MIN_VIX} | Stop {STOP_LOSS_PCT}%",
+        fontsize=13, fontweight="bold", y=1.002)
+
+    # Panel 1: Cash balance — one point per month
+    ax = axes[0]
+    ax.plot(pf_mo.index, pf_mo["cash"], color=C["port"], lw=2.2,
+            marker="o", markersize=3.5, label="Cash Balance (strategy P&L)")
+    ax.plot(pf_mo.index, pf_mo["bah_cash_equiv"], color=C["spy"], lw=1.5,
+            alpha=0.8, label=f"SPY return on ${INITIAL_CASH:,.0f} (reference)")
+    ax.axhline(INITIAL_CASH, color=C["border"], lw=0.8, ls="--",
+               label=f"Starting cash ${INITIAL_CASH:,.0f}")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_ylabel("Cash Balance ($)")
+    ax.set_title(f"CAGR {m['cagr']:.2%}  |  Sharpe {m['sharpe']:.2f}  |  "
+                 f"Max DD {m['max_drawdown']:.2%}  |  Win Rate {m['win_rate']:.2%}")
+    ax.legend(fontsize=9, loc="upper left")
+    ax.grid(True)
+    ax2 = ax.twinx()
+    ax2.fill_between(pf_mo.index, pf_mo["vix"], alpha=0.07, color=C["vix"])
+    ax2.set_ylabel("VIX", color=C["vix"], fontsize=8)
+    ax2.tick_params(axis="y", labelcolor=C["vix"], labelsize=7)
+    ax2.set_ylim(0, pf_mo["vix"].max() * 4)
+
+    # Panel 2: Drawdown (monthly)
+    ax = axes[1]
+    ax.fill_between(pf_mo.index, pf_mo["dd"],     0, color=C["port"], alpha=0.6,
+                    label="Cash DD")
+    ax.fill_between(pf_mo.index, pf_mo["dd_bah"], 0, color=C["spy"],  alpha=0.3,
+                    label="SPY DD")
+    ax.set_ylabel("Drawdown (%)")
+    ax.set_title("Cash Balance Drawdown vs SPY Reference")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # Panel 3: Rolling 12-month cash Sharpe (using daily returns, plotted monthly)
+    roll = pf["returns"].rolling(252).apply(
+        lambda x: x.mean() / x.std() * np.sqrt(252) if x.std() > 0 else np.nan)
+    roll_mo = roll.resample("ME").last()
+    ax = axes[2]
+    ax.plot(roll_mo.index, roll_mo.values, color=C["neutral"], lw=1.8,
+            marker="o", markersize=2.5)
+    ax.axhline(0, color=C["border"], lw=0.8, ls="--")
+    ax.axhline(1, color=C["win"],    lw=0.8, ls=":", label="Sharpe=1")
+    ax.fill_between(roll_mo.index, roll_mo, 0,
+                    where=(roll_mo >= 0), color=C["win"],  alpha=0.2)
+    ax.fill_between(roll_mo.index, roll_mo, 0,
+                    where=(roll_mo <  0), color=C["loss"], alpha=0.2)
+    ax.set_ylabel("Rolling Sharpe (252d)")
+    ax.set_title("Rolling 252-Day Sharpe (Cash Returns)")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # Panel 4: Monthly cash P&L bars (one per month from trade data)
+    done_sorted = done.sort_values("entry_date")
+    done_sorted["entry_dt"] = pd.to_datetime(done_sorted["entry_date"])
+    done_sorted["ym"] = done_sorted["entry_dt"].dt.to_period("M").dt.to_timestamp()
+    mo_pnl = done_sorted.groupby("ym")["total_pnl"].sum()
+    ax = axes[3]
+    ax.bar(mo_pnl.index, mo_pnl.values, width=20,
+           color=[C["win"] if v >= 0 else C["loss"] for v in mo_pnl.values],
+           alpha=0.85)
+    ax.axhline(0, color=C["border"], lw=0.5)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_ylabel("Monthly P&L ($)")
+    ax.set_title("Monthly Options P&L")
+    ax.grid(True)
+
+    plt.tight_layout()
+    _show(fig, "01_equity_overview.png")
+
+
+# ── Chart 02 — Trade P&L analysis ────────────────────────────────────────────
+def chart_02_trades(trades_df, pf):
+    done = _active(trades_df).copy()
+    # compute hold_d BEFORE slicing wins/losses
+    done["hold_d"]   = (pd.to_datetime(done["exit_date"]) -
+                        pd.to_datetime(done["entry_date"])).dt.days.fillna(0).astype(int)
+    done["credit_pct"] = done["total_credit"] / (
+        done["width"] * CONTRACT_SIZE * done["n_contracts"]) * 100
+    done["cum_pnl"]  = done["total_pnl"].cumsum()
+
+    wins = done[done["total_pnl"] >= 0]
+    lsss = done[done["total_pnl"] <  0]
+
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    fig.suptitle("Trade-Level Analysis", fontsize=14, fontweight="bold")
+
+    # 1: P&L histogram
+    ax = axes[0, 0]
+    ax.hist(wins["total_pnl"], bins=40, color=C["win"],  alpha=0.72, density=True,
+            label=f"Wins ({len(wins)})")
+    ax.hist(lsss["total_pnl"], bins=40, color=C["loss"], alpha=0.72, density=True,
+            label=f"Losses ({len(lsss)})")
+    ax.axvline(done["total_pnl"].mean(), color="white", lw=1.8, ls="--",
+               label=f"Mean ${done['total_pnl'].mean():,.0f}")
+    ax.set_xlabel("P&L ($)"); ax.set_title("P&L Distribution")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # 2: VIX vs P&L
+    ax = axes[0, 1]
+    ax.scatter(wins["vix_entry"], wins["total_pnl"], color=C["win"],
+               alpha=0.5, s=18, label="Win")
+    ax.scatter(lsss["vix_entry"], lsss["total_pnl"], color=C["loss"],
+               alpha=0.5, s=18, label="Loss")
+    ax.axhline(0, color=C["border"], lw=0.7, ls="--")
+    ax.set_xlabel("VIX at Entry"); ax.set_ylabel("P&L ($)")
+    ax.set_title("VIX at Entry vs P&L"); ax.legend(fontsize=8); ax.grid(True)
+
+    # 3: Cumulative P&L (one point per trade, plotted by entry date)
+    ax = axes[0, 2]
+    ax.plot(done["entry_date"], done["cum_pnl"], color=C["port"], lw=2,
+            marker="o", markersize=3)
+    ax.fill_between(done["entry_date"], done["cum_pnl"], 0,
+                    where=(done["cum_pnl"] >= 0), color=C["win"],  alpha=0.2)
+    ax.fill_between(done["entry_date"], done["cum_pnl"], 0,
+                    where=(done["cum_pnl"] <  0), color=C["loss"], alpha=0.2)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_title("Cumulative Options P&L")
+    ax.set_ylabel("Cum P&L ($)"); ax.grid(True)
+
+    # 4: Contracts over time
+    ax = axes[1, 0]
+    ax.bar(done["entry_date"], done["n_contracts"], width=20,
+           color=C["neutral"], alpha=0.8)
+    ax.set_ylabel("# Contracts"); ax.set_title("Position Size (Contracts)")
+    ax.grid(True)
+
+    # 5: Buying power vs max loss exposure
+    ax = axes[1, 1]
+    ax.plot(done["entry_date"], done["buying_power"], color=C["gold"],
+            lw=1.5, label="Buying Power")
+    max_exp = done["max_loss_ps"] * CONTRACT_SIZE * done["n_contracts"]
+    ax.plot(done["entry_date"], max_exp, color=C["loss"], lw=1.5, ls="--",
+            label="Max Loss Exposure")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_title("Buying Power vs Max Loss Exposure")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # 6: Credit collected vs realised P&L
+    ax = axes[1, 2]
+    ax.bar(done["entry_date"], done["total_credit"], width=20,
+           color=C["teal"], alpha=0.8, label="Credit Collected")
+    ax.plot(done["entry_date"], done["total_pnl"],
+            color=C["win"], lw=1.5, label="Realised P&L")
+    ax.axhline(0, color=C["border"], lw=0.5)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_title("Credit Collected vs Realised P&L")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    plt.tight_layout()
+    _show(fig, "02_trade_analysis.png")
+
+
+# ── Chart 03 — Monthly P&L heatmap ───────────────────────────────────────────
+def chart_03_heatmap(trades_df):
+    done = _active(trades_df).copy()
+    done["year"]  = pd.to_datetime(done["entry_date"]).dt.year
+    done["month"] = pd.to_datetime(done["entry_date"]).dt.month
+    pivot = done.pivot_table("total_pnl", index="year", columns="month", aggfunc="sum")
+    pivot.columns = ["Jan","Feb","Mar","Apr","May","Jun",
+                     "Jul","Aug","Sep","Oct","Nov","Dec"]
+    vmax = float(np.abs(pivot.values[~np.isnan(pivot.values)]).max())
+    cmap = LinearSegmentedColormap.from_list("pnl", [C["loss"], "#1a1a2e", C["win"]])
+    fig, ax = plt.subplots(figsize=(18, max(5, len(pivot) * 0.47)))
+    fig.suptitle("Monthly P&L Heatmap ($) — options premium only",
+                 fontsize=13, fontweight="bold")
+    sns.heatmap(pivot, ax=ax, cmap=cmap, center=0, vmin=-vmax, vmax=vmax,
+                annot=True, fmt=".0f", linewidths=0.3, linecolor=C["grid"],
+                cbar_kws={"label": "P&L ($)", "shrink": 0.5})
+    ax.set_xlabel("Month"); ax.set_ylabel("Year")
+    plt.tight_layout()
+    _show(fig, "03_monthly_heatmap.png")
+
+
+# ── Chart 04 — Spread pricing detail ─────────────────────────────────────────
+def chart_04_spread_detail(trades_df):
+    done = _active(trades_df).sort_values("entry_date")
+    fig, axes = plt.subplots(4, 1, figsize=(16, 18), sharex=True)
+    fig.suptitle("Spread Pricing Detail (one point per trade)", fontsize=13, fontweight="bold")
+
+    ax = axes[0]
+    ax.plot(done["entry_date"], done["sig_short"] * 100, color="#E67E22", lw=1.5,
+            marker="o", markersize=2.5, label="Short Put IV (skew-adj)")
+    ax.plot(done["entry_date"], done["sig_long"]  * 100, color=C["loss"],  lw=1.5,
+            marker="o", markersize=2.5, label="Long Put IV (skew-adj)")
+    ax.plot(done["entry_date"], done["vix_entry"],        color=C["vix"],  lw=1.0,
+            ls="--", alpha=0.8, label="VIX")
+    ax.set_ylabel("Implied Vol (%)"); ax.set_title("Skew-Adjusted IVs vs VIX")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    ax = axes[1]
+    ax.plot(done["entry_date"], done["prem"],        color=C["win"],  lw=1.5,
+            marker="o", markersize=2.5, label="Premium / share")
+    ax.plot(done["entry_date"], done["max_loss_ps"], color=C["loss"], lw=1.5,
+            marker="o", markersize=2.5, label="Max Loss / share")
+    ax.set_ylabel("$ / share"); ax.set_title("Premium vs Max Loss Per Share")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    ax = axes[2]
+    cr = done["prem"] / done["width"] * 100
+    ax.plot(done["entry_date"], cr, color=C["neutral"], lw=1.5,
+            marker="o", markersize=2.5)
+    ax.axhline(cr.mean(), color="white", lw=1.0, ls="--",
+               label=f"Mean {cr.mean():.1f}%")
+    ax.fill_between(done["entry_date"], cr, alpha=0.18, color=C["neutral"])
+    ax.set_ylabel("Credit / Width (%)"); ax.set_title("Credit as % of Spread Width")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    ax = axes[3]
+    ax.plot(done["entry_date"], done["spy_entry"], color=C["spy"],  lw=1.5,
+            marker="o", markersize=2.5, label="SPY spot")
+    ax.plot(done["entry_date"], done["K_s"],       color="#E67E22", lw=1.2, ls="--",
+            label=f"Short K ({SHORT_PUT_OTM}% OTM)")
+    ax.plot(done["entry_date"], done["K_l"],       color=C["loss"], lw=1.2, ls=":",
+            label=f"Long K ({LONG_PUT_OTM}% OTM)")
+    ax.set_ylabel("Price ($)"); ax.set_title("Strike Levels vs SPY Spot")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    plt.tight_layout()
+    _show(fig, "04_spread_detail.png")
+
+
+# ── Chart 05 — Capital & cash accounting (monthly) ───────────────────────────
+def chart_05_capital(trades_df, pf, pf_mo):
+    done = _active(trades_df).sort_values("entry_date")
+    fig, axes = plt.subplots(3, 1, figsize=(16, 14), sharex=True)
+    fig.suptitle("Capital & Cash Accounting (Monthly)", fontsize=13, fontweight="bold")
+
+    ax = axes[0]
+    ax.stackplot(pf_mo.index,
+                 pf_mo["cash"].clip(lower=0),
+                 pf_mo["spy_value"],
+                 labels=["Cash Balance", "SPY Mark-to-Market"],
+                 colors=[C["teal"], C["spy"]], alpha=0.75)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_title("Portfolio Composition — Cash vs SPY Value (Monthly)")
+    ax.legend(fontsize=8, loc="upper left"); ax.grid(True)
+
+    ax = axes[1]
+    ax.plot(done["entry_date"], done["cash_entry"], color=C["win"], lw=1.8,
+            marker="o", markersize=4, label="Cash at Entry")
+    ax2 = ax.twinx()
+    ax2.plot(done["entry_date"], done["buying_power"], color=C["gold"], lw=1.8,
+             ls="--", marker="s", markersize=3, label="Buying Power")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_ylabel("Cash ($)", color=C["win"])
+    ax2.set_ylabel("Buying Power ($)", color=C["gold"])
+    ax.set_title("Cash & Buying Power at Each Entry")
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1+h2, l1+l2, fontsize=8); ax.grid(True)
+
+    ax = axes[2]
+    pf_mo["cash_pct"] = pf_mo["cash"] / pf_mo["total_value"] * 100
+    ax.plot(pf_mo.index, pf_mo["cash_pct"], color=C["teal"], lw=1.8,
+            marker="o", markersize=2.5)
+    ax.fill_between(pf_mo.index, pf_mo["cash_pct"], alpha=0.2, color=C["teal"])
+    ax.axhline(pf_mo["cash_pct"].mean(), color="white", lw=1.0, ls="--",
+               label=f"Mean {pf_mo['cash_pct'].mean():.1f}%")
+    ax.set_ylabel("Cash as % of Total Portfolio")
+    ax.set_title("Cash Allocation Over Time (Monthly)")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    plt.tight_layout()
+    _show(fig, "05_capital_accounting.png")
+
+
+# ── Chart 06 — Rolling metrics (monthly points) ───────────────────────────────
+def chart_06_rolling(pf, pf_mo):
+    ret = pf["returns"]   # daily, for rolling window width
+    fig, axes = plt.subplots(4, 1, figsize=(16, 18), sharex=True)
+    fig.suptitle("Rolling Performance Metrics — Cash Returns (Monthly)", fontsize=13, fontweight="bold")
+
+    def mo(series):
+        return series.resample("ME").last()
+
+    configs = [
+        ("Sharpe Ratio (252d)",
+         mo(ret.rolling(252).apply(
+             lambda x: x.mean()/x.std()*np.sqrt(252) if x.std()>0 else np.nan)),
+         C["neutral"], True),
+        ("Ann. Volatility % (252d)",
+         mo(ret.rolling(252).std() * np.sqrt(252) * 100),
+         C["gold"], False),
+        ("Ann. Return % (252d)",
+         mo(((1+ret).rolling(252).apply(np.prod)-1)*100),
+         C["port"], True),
+        ("Max DD in Window % (252d)",
+         mo(ret.rolling(252).apply(
+             lambda x: ((np.cumprod(1+x)/np.maximum.accumulate(np.cumprod(1+x)))-1).min()*100)),
+         C["loss"], False),
+    ]
+    for ax, (label, series, color, signed) in zip(axes, configs):
+        ax.plot(series.index, series.values, color=color, lw=1.8,
+                marker="o", markersize=2.5)
+        ax.axhline(0, color=C["border"], lw=0.7, ls="--")
+        if signed:
+            ax.fill_between(series.index, series, 0,
+                            where=(series >= 0), color=color, alpha=0.2)
+            ax.fill_between(series.index, series, 0,
+                            where=(series <  0), color=C["loss"], alpha=0.2)
+        else:
+            ax.fill_between(series.index, series, alpha=0.15, color=color)
+        ax.set_ylabel(label, fontsize=9); ax.grid(True)
+
+    plt.tight_layout()
+    _show(fig, "06_rolling_metrics.png")
+
+
+# ── Chart 07 — Win/loss deep dive ─────────────────────────────────────────────
+def chart_07_win_loss(trades_df):
+    done = _active(trades_df).copy()
+    # hold_d computed FIRST, before slicing
+    done["hold_d"] = (pd.to_datetime(done["exit_date"]) -
+                      pd.to_datetime(done["entry_date"])).dt.days.fillna(0).astype(int)
+    wins = done[done["total_pnl"] >= 0]
+    lsss = done[done["total_pnl"] <  0]
+
+    streak = []; cur = 0
+    for v in (done["total_pnl"] >= 0).values:
+        cur = cur + 1 if v else cur - 1
+        streak.append(cur)
+
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    fig.suptitle("Win / Loss Deep Dive", fontsize=14, fontweight="bold")
+
+    # 1: ECDF
+    ax = axes[0, 0]
+    for data, color, label in [(wins["total_pnl"], C["win"], "Wins"),
+                                (lsss["total_pnl"], C["loss"], "Losses")]:
+        s = np.sort(data.values); y = np.arange(1, len(s)+1)/len(s)
+        ax.plot(s, y, color=color, lw=2, label=label)
+    ax.axvline(0, color=C["border"], lw=0.8, ls="--")
+    ax.set_xlabel("P&L ($)"); ax.set_title("ECDF of Trade P&L")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # 2: Hold duration vs P&L
+    ax = axes[0, 1]
+    ax.scatter(wins["hold_d"], wins["total_pnl"], color=C["win"],  alpha=0.5, s=22, label="Win")
+    ax.scatter(lsss["hold_d"], lsss["total_pnl"], color=C["loss"], alpha=0.5, s=22, label="Loss")
+    ax.axhline(0, color=C["border"], lw=0.7, ls="--")
+    ax.set_xlabel("Hold Duration (days)"); ax.set_ylabel("P&L ($)")
+    ax.set_title("Hold Duration vs P&L"); ax.legend(fontsize=8); ax.grid(True)
+
+    # 3: By exit reason
+    ax = axes[0, 2]
+    by_r = done.groupby("exit_reason")["total_pnl"].agg(["sum","count","mean"])
+    bars = ax.bar(by_r.index, by_r["sum"],
+                  color=[C["win"] if v >= 0 else C["loss"] for v in by_r["sum"]], alpha=0.85)
+    for bar, (_, row) in zip(bars, by_r.iterrows()):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                f"n={int(row['count'])}\nμ=${row['mean']:,.0f}",
+                ha="center", va="bottom", fontsize=8, color=C["text"])
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_title("Total P&L by Exit Reason"); ax.grid(True, axis="y")
+
+    # 4: Rolling 24-trade win rate
+    ax = axes[1, 0]
+    roll_wr = (done["total_pnl"] >= 0).rolling(24).mean() * 100
+    ax.plot(done["entry_date"].values, roll_wr.values, color=C["neutral"], lw=1.8)
+    ax.axhline(50, color=C["border"], lw=0.8, ls="--")
+    ax.fill_between(done["entry_date"].values, roll_wr, 50,
+                    where=(roll_wr >= 50), color=C["win"],  alpha=0.25)
+    ax.fill_between(done["entry_date"].values, roll_wr, 50,
+                    where=(roll_wr <  50), color=C["loss"], alpha=0.25)
+    ax.set_ylabel("Win Rate (%)"); ax.set_title("Rolling 24-Trade Win Rate"); ax.grid(True)
+
+    # 5: Streak
+    ax = axes[1, 1]
+    ax.bar(range(len(streak)), streak,
+           color=[C["win"] if v > 0 else C["loss"] for v in streak], alpha=0.75)
+    ax.axhline(0, color=C["border"], lw=0.5)
+    ax.set_xlabel("Trade #"); ax.set_ylabel("Running Streak")
+    ax.set_title("Win(+) / Loss(−) Streak"); ax.grid(True, axis="y")
+
+    # 6: Annual P&L
+    ax = axes[1, 2]
+    done2 = done.copy()
+    done2["year"] = pd.to_datetime(done2["entry_date"]).dt.year
+    by_yr = done2.groupby("year")["total_pnl"].sum()
+    ax.bar(by_yr.index, by_yr.values,
+           color=[C["win"] if v >= 0 else C["loss"] for v in by_yr.values], alpha=0.85)
+    ax.axhline(0, color=C["border"], lw=0.5)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_title("Annual P&L (Options Premium)"); ax.grid(True, axis="y")
+
+    plt.tight_layout()
+    _show(fig, "07_win_loss_deepdive.png")
+
+
+# ── Chart 08 — Return attribution (monthly) ───────────────────────────────────
+def chart_08_attribution(pf, pf_mo, trades_df):
+    done = _active(trades_df).sort_values("entry_date")
+    ret  = pf["returns"]
+
+    strat_12m = (1 + ret).rolling(252).apply(np.prod) - 1
+    bah_12m   = (1 + pf["bah_returns"]).rolling(252).apply(np.prod) - 1
+    alpha     = strat_12m - bah_12m
+
+    strat_12m_mo = strat_12m.resample("ME").last()
+    bah_12m_mo   = bah_12m.resample("ME").last()
+    alpha_mo     = alpha.resample("ME").last()
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    fig.suptitle("Return Attribution (Monthly)", fontsize=13, fontweight="bold")
+
+    # 1: Rolling 12M alpha (monthly)
+    ax = axes[0, 0]
+    ax.fill_between(alpha_mo.index, alpha_mo * 100, 0,
+                    where=(alpha_mo >= 0), color=C["win"],  alpha=0.6, label="Outperform")
+    ax.fill_between(alpha_mo.index, alpha_mo * 100, 0,
+                    where=(alpha_mo < 0),  color=C["loss"], alpha=0.6, label="Underperform")
+    ax.plot(alpha_mo.index, alpha_mo * 100, color=C["port"], lw=1.2)
+    ax.axhline(0, color=C["border"], lw=0.6)
+    ax.set_ylabel("Excess Return vs SPY (pp)")
+    ax.set_title("Rolling 12-Month Alpha vs SPY (Cash basis)")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # 2: Cash gain vs SPY gain decomposition (monthly)
+    ax = axes[0, 1]
+    init_spy  = pf_mo["spy_value"].iloc[0]
+    init_cash = INITIAL_CASH
+    spy_gain  = pf_mo["spy_value"] - init_spy
+    opt_gain  = pf_mo["cash"] - init_cash
+    ax.stackplot(pf_mo.index,
+                 [spy_gain.clip(lower=0), opt_gain.clip(lower=0)],
+                 labels=["SPY Appreciation", "Options Premium"],
+                 colors=[C["spy"], C["win"]], alpha=0.75)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_title("Gain Decomposition — SPY vs Options Cash")
+    ax.legend(fontsize=8, loc="upper left"); ax.grid(True)
+
+    # 3: 12M rolling return comparison (monthly)
+    ax = axes[1, 0]
+    ax.plot(strat_12m_mo.index, strat_12m_mo * 100, color=C["port"], lw=1.8,
+            marker="o", markersize=2.5, label="Cash Returns")
+    ax.plot(bah_12m_mo.index,   bah_12m_mo   * 100, color=C["spy"],  lw=1.4,
+            alpha=0.75, marker="o", markersize=2.5, label="SPY B&H")
+    ax.axhline(0, color=C["border"], lw=0.6, ls="--")
+    ax.set_ylabel("Rolling 12M Return (%)")
+    ax.set_title("Rolling 1-Year Cash Return vs SPY")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # 4: Monthly return scatter (cash vs SPY)
+    mo_s   = pf["returns"].resample("ME").apply(lambda x: (1+x).prod()-1)
+    mo_b   = pf["bah_returns"].resample("ME").apply(lambda x: (1+x).prod()-1)
+    mo_s   = mo_s.reindex(mo_b.index).dropna()
+    mo_b   = mo_b.reindex(mo_s.index).dropna()
+    ax = axes[1, 1]
+    ax.scatter(mo_b * 100, mo_s * 100,
+               c=[C["win"] if v >= 0 else C["loss"] for v in mo_s],
+               alpha=0.65, s=22)
+    if len(mo_b) > 1:
+        z  = np.polyfit(mo_b * 100, mo_s * 100, 1)
+        xl = np.linspace(mo_b.min()*100, mo_b.max()*100, 100)
+        ax.plot(xl, np.polyval(z, xl), color="white", lw=1.2, ls="--",
+                label=f"β={z[0]:.2f}")
+    ax.axhline(0, color=C["border"], lw=0.5, ls=":")
+    ax.axvline(0, color=C["border"], lw=0.5, ls=":")
+    corr = float(np.corrcoef(mo_b, mo_s)[0, 1]) if len(mo_b) > 1 else 0
+    ax.set_xlabel("SPY Monthly Return (%)"); ax.set_ylabel("Cash Monthly Return (%)")
+    ax.set_title(f"Monthly Return Correlation  ρ={corr:.2f}")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    plt.tight_layout()
+    _show(fig, "08_attribution.png")
+
+
+# ── Chart 09 — Metrics summary card ───────────────────────────────────────────
+def chart_09_metrics(m, trades_df):
+    perf = [
+        ["CAGR (cash only)",      f"{m['cagr']:.2%}"],
+        ["Total Return (cash)",   f"{m['total_return']:.2%}"],
+        ["Sharpe Ratio",          f"{m['sharpe']:.2f}"],
+        ["Sortino Ratio",         f"{m['sortino']:.2f}"],
+        ["Calmar Ratio",          f"{m['calmar']:.2f}"],
+        ["Annual Volatility",     f"{m['annual_vol']:.2%}"],
+        ["Max Drawdown (cash)",   f"{m['max_drawdown']:.2%}"],
+        ["Win Rate",              f"{m['win_rate']:.2%}"],
+        ["Profit Factor",         f"{m['profit_factor']:.2f}"],
+        ["Total Trades",          f"{m['n_trades']:,}"],
+        ["Months Skipped VIX",    f"{m['vix_skipped']:,}"],
+        ["Avg Win",               f"${m['avg_win']:,.0f}"],
+        ["Avg Loss",              f"${m['avg_loss']:,.0f}"],
+        ["Stop-Loss Rate",        f"{m['stop_loss_rate']:.2%}"],
+        ["Total Options P&L",     f"${m['total_pnl']:,.0f}"],
+        ["Initial Cash",          f"${m['initial_cash']:,.0f}"],
+        ["Final Cash",            f"${m['final_cash']:,.0f}"],
+        ["Years Tested",          f"{m['years']:.1f}"],
+    ]
+    params = [
+        ["Entry Day of Month",  f"{TRADE_DAY}"],
+        ["Min VIX",             f"{MIN_VIX}"],
+        ["Short Put OTM",       f"{SHORT_PUT_OTM}%  →  K = spot × {1-SHORT_PUT_OTM/100:.2f}"],
+        ["Long Put OTM",        f"{LONG_PUT_OTM}%  →  K = spot × {1-LONG_PUT_OTM/100:.2f}"],
+        ["Spread Width",        f"{LONG_PUT_OTM-SHORT_PUT_OTM:.0f}% of spot"],
+        ["Stop Loss",           f"{STOP_LOSS_PCT}% of max loss"],
+        ["Expiry",              "1 calendar month"],
+        ["Initial Cash",        f"${INITIAL_CASH:,.0f}  (100% margin)"],
+        ["Initial SPY",         f"${INITIAL_SPY_VALUE:,.0f}  (25% margin)"],
+        ["Contract Size",       f"{CONTRACT_SIZE} shares"],
+    ]
+    fig, ax = plt.subplots(figsize=(15, 10))
+    ax.axis("off"); fig.patch.set_facecolor(C["bg"])
+
+    def _tbl(rows, cols, bbox):
+        t = ax.table(cellText=rows, colLabels=cols, loc="center", bbox=bbox)
+        t.auto_set_font_size(False); t.set_fontsize(9.5)
+        for (r, c), cell in t.get_celld().items():
+            cell.set_edgecolor(C["border"])
+            if r == 0:
+                cell.set_facecolor("#1E3A5F")
+                cell.set_text_props(color="white", fontweight="bold")
+            else:
+                cell.set_facecolor("#111827" if r % 2 else "#1F2937")
+                cell.set_text_props(color=C["text"])
+
+    _tbl(perf,   ["Metric", "Value"],    [0.0,  0.0,  0.46, 1.0])
+    _tbl(params, ["Parameter", "Value"], [0.54, 0.24, 0.46, 0.76])
+    ax.set_title("Strategy Summary Card — Cash Performance Only",
+                 fontsize=13, fontweight="bold", color=C["text"], pad=14)
+    _show(fig, "09_metrics_card.png")
+    done = _active(trades_df)
+    wins = done[done["total_pnl"] >= 0]
+    lsss = done[done["total_pnl"] <  0]
+
+    fig, axes = plt.subplots(4, 1, figsize=(17, 22),
+                              gridspec_kw={"height_ratios": [3, 1.2, 1.2, 1]})
+    fig.suptitle(
+        f"SPY Put Spread — Equity Overview\n"
+        f"Short {SHORT_PUT_OTM}% OTM | Long {LONG_PUT_OTM}% OTM | "
+        f"Day {TRADE_DAY} | Min VIX {MIN_VIX} | Stop {STOP_LOSS_PCT}%",
+        fontsize=13, fontweight="bold", y=1.002,
+    )
+
+    # Panel 1: equity curve (log)
+    ax = axes[0]
+    for _, t in wins.iterrows():
+        ax.axvspan(t["entry_date"], t["exit_date"], alpha=0.04, color=C["win"],  lw=0)
+    for _, t in lsss.iterrows():
+        ax.axvspan(t["entry_date"], t["exit_date"], alpha=0.12, color=C["loss"], lw=0)
+    ax.plot(pf.index, pf["total_value"], color=C["port"], lw=2.2, label="Strategy", zorder=3)
+    ax.plot(pf.index, pf["bah_value"],   color=C["spy"],  lw=1.5, alpha=0.8,
+            label="SPY Buy & Hold", zorder=2)
+    ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.set_ylabel("Portfolio Value (log)")
+    ax.legend(fontsize=9, loc="upper left")
+    ax.set_title(f"CAGR {m['cagr']:.2%}  |  Sharpe {m['sharpe']:.2f}  |  "
+                 f"Max DD {m['max_drawdown']:.2%}  |  Win Rate {m['win_rate']:.2%}")
+    ax.grid(True)
+    ax2 = ax.twinx()
+    ax2.fill_between(pf.index, pf["vix"], alpha=0.07, color=C["vix"])
+    ax2.set_ylabel("VIX", color=C["vix"], fontsize=8)
+    ax2.tick_params(axis="y", labelcolor=C["vix"], labelsize=7)
+    ax2.set_ylim(0, pf["vix"].max() * 4)
+
+    # Panel 2: drawdown
+    ax = axes[1]
+    ax.fill_between(pf.index, pf["dd"],     0, color=C["port"], alpha=0.6, label="Strategy")
+    ax.fill_between(pf.index, pf["dd_bah"], 0, color=C["spy"],  alpha=0.3, label="SPY B&H")
+    ax.set_ylabel("Drawdown (%)")
+    ax.set_title("Drawdown")
+    ax.legend(fontsize=8)
+    ax.grid(True)
+
+    # Panel 3: rolling 252-day Sharpe
+    ax = axes[2]
+    roll = pf["returns"].rolling(252).apply(
+        lambda x: x.mean() / x.std() * np.sqrt(252) if x.std() > 0 else np.nan)
+    ax.plot(roll.index, roll.values, color=C["neutral"], lw=1.5)
+    ax.axhline(0, color=C["border"], lw=0.8, ls="--")
+    ax.axhline(1, color=C["win"],    lw=0.8, ls=":",  label="Sharpe=1")
+    ax.fill_between(roll.index, roll, 0, where=(roll >= 0), color=C["win"],  alpha=0.2)
+    ax.fill_between(roll.index, roll, 0, where=(roll <  0), color=C["loss"], alpha=0.2)
+    ax.set_ylabel("Rolling Sharpe")
+    ax.set_title("Rolling 252-Day Sharpe")
+    ax.legend(fontsize=8)
+    ax.grid(True)
+
+    # Panel 4: monthly returns bars
+    ax = axes[3]
+    mo  = pf["total_value"].resample("ME").last().pct_change().dropna() * 100
+    bmo = pf["bah_value"].resample("ME").last().pct_change().dropna() * 100
+    bmo = bmo.reindex(mo.index)
+    ax.bar(mo.index, mo.values, width=20,
+           color=[C["win"] if v >= 0 else C["loss"] for v in mo.values],
+           alpha=0.8, label="Strategy")
+    ax.plot(bmo.index, bmo.values, color=C["spy"], lw=1.0, alpha=0.7, label="SPY B&H")
+    ax.axhline(0, color=C["border"], lw=0.5)
+    ax.set_ylabel("Monthly Ret (%)")
+    ax.set_title("Monthly Returns vs SPY")
+    ax.legend(fontsize=8)
+    ax.grid(True)
+
+    plt.tight_layout()
+    _show(fig, "01_equity_overview.png")
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — INTERACTIVE PLOTLY CHARTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def iplot_01_equity(pf, pf_mo, trades_df, m):
+    """Cash balance monthly + SPY reference, drawdown, VIX — all monthly."""
+    done = _active(trades_df)
+    wins = done[done["total_pnl"] >= 0]
+    lsss = done[done["total_pnl"] <  0]
+
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        subplot_titles=["Cash Balance ($) — Monthly", "Cash Drawdown (%)", "VIX (Monthly)"],
+        row_heights=[0.55, 0.25, 0.20], vertical_spacing=0.04)
+
+    fig.add_trace(go.Scatter(
+        x=pf_mo.index, y=pf_mo["cash"], name="Cash Balance",
+        line=dict(color=C["port"], width=2.2), mode="lines+markers",
+        marker=dict(size=4),
+        hovertemplate="%{x|%b %Y}: $%{y:,.0f}<extra>Cash</extra>"), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=pf_mo.index, y=pf_mo["bah_cash_equiv"], name=f"SPY on ${INITIAL_CASH:,.0f}",
+        line=dict(color=C["spy"], width=1.5), mode="lines+markers",
+        marker=dict(size=3),
+        hovertemplate="%{x|%b %Y}: $%{y:,.0f}<extra>SPY ref</extra>"), row=1, col=1)
+
+    # Trade exit markers on cash line
+    for grp, color, sym, tag in [(wins, C["win"], "triangle-up", "Win"),
+                                  (lsss, C["loss"], "triangle-down", "Loss")]:
+        fig.add_trace(go.Scatter(
+            x=grp["exit_date"],
+            y=pf["cash"].reindex(grp["exit_date"]).values,
+            mode="markers", name=f"{tag} Exit",
+            marker=dict(color=color, size=8, symbol=sym),
+            customdata=grp[["total_pnl", "exit_reason"]].values,
+            hovertemplate=f"{tag}: $%{{customdata[0]:,.0f}} (%{{customdata[1]}})<extra></extra>"),
+            row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=pf_mo.index, y=pf_mo["dd"], name="Cash Drawdown",
+        fill="tozeroy", fillcolor="rgba(231,76,60,0.25)",
+        line=dict(color=C["loss"], width=1),
+        hovertemplate="%{x|%b %Y}: %{y:.1f}%<extra>DD</extra>"), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=pf_mo.index, y=pf_mo["vix"], name="VIX",
+        fill="tozeroy", fillcolor="rgba(149,165,166,0.12)",
+        line=dict(color=C["vix"], width=1),
+        hovertemplate="%{x|%b %Y}: %{y:.1f}<extra>VIX</extra>"), row=3, col=1)
+    fig.add_hline(y=MIN_VIX, row=3, col=1, line_dash="dash", line_color="orange",
+                  annotation_text=f"Min VIX {MIN_VIX}")
+
+    fig.update_layout(
+        title=(f"Cash Balance — Monthly │ CAGR {m['cagr']:.2%} │ "
+               f"Sharpe {m['sharpe']:.2f} │ Max DD {m['max_drawdown']:.2%}"),
+        height=900, hovermode="x unified")
+    _showly(fig, "i01_equity_curve.html")
+
+
+def iplot_02_waterfall(trades_df):
+    done = _active(trades_df).sort_values("entry_date").copy()
+    done["cum_pnl"] = done["total_pnl"].cumsum()
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        subplot_titles=["Trade P&L ($)", "Cumulative Cash P&L ($)"],
+                        vertical_spacing=0.08)
+    fig.add_trace(go.Bar(
+        x=done["entry_date"], y=done["total_pnl"], name="Trade P&L",
+        marker_color=[C["win"] if v >= 0 else C["loss"] for v in done["total_pnl"]],
+        customdata=np.stack([done["vix_entry"], done["n_contracts"],
+                             done["K_s"].round(2), done["K_l"].round(2),
+                             done["exit_reason"]], axis=-1),
+        hovertemplate=(
+            "<b>Entry:</b> %{x}<br><b>P&L:</b> $%{y:,.0f}<br>"
+            "<b>VIX:</b> %{customdata[0]:.1f}<br>"
+            "<b>Contracts:</b> %{customdata[1]}<br>"
+            "<b>Short K:</b> $%{customdata[2]}<br>"
+            "<b>Long K:</b> $%{customdata[3]}<br>"
+            "<b>Exit:</b> %{customdata[4]}<extra></extra>"
+        )), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=done["entry_date"], y=done["cum_pnl"], name="Cumulative P&L",
+        line=dict(color=C["port"], width=2.2), mode="lines+markers",
+        marker=dict(size=4),
+        fill="tozeroy", fillcolor="rgba(155,89,182,0.15)"), row=2, col=1)
+    fig.update_layout(title="Trade P&L Waterfall — hover for full detail",
+                      height=720, bargap=0.12)
+    _showly(fig, "i02_trade_waterfall.html")
+
+
+def iplot_03_capital(pf, pf_mo, trades_df):
+    done = _active(trades_df).sort_values("entry_date")
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        subplot_titles=["Cash & SPY Value — Monthly ($)",
+                                        "Cash Balance & Buying Power at Entry ($)"],
+                        vertical_spacing=0.08)
+    fig.add_trace(go.Scatter(
+        x=pf_mo.index, y=pf_mo["spy_value"], name="SPY Value",
+        fill="tozeroy", fillcolor="rgba(243,156,18,0.2)",
+        line=dict(color=C["spy"], width=1.5),
+        hovertemplate="%{x|%b %Y}: $%{y:,.0f}<extra>SPY</extra>"), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=pf_mo.index, y=pf_mo["cash"], name="Cash Balance",
+        line=dict(color=C["win"], width=2), mode="lines+markers",
+        marker=dict(size=3),
+        hovertemplate="%{x|%b %Y}: $%{y:,.0f}<extra>Cash</extra>"), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=done["entry_date"], y=done["cash_entry"], name="Cash at Entry",
+        mode="lines+markers", line=dict(color=C["win"], width=1.8),
+        marker=dict(size=5),
+        hovertemplate="%{x}: $%{y:,.0f}<extra>Cash at Entry</extra>"), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=done["entry_date"], y=done["buying_power"], name="Buying Power",
+        mode="lines+markers", line=dict(color=C["gold"], width=1.8, dash="dash"),
+        marker=dict(size=5),
+        hovertemplate="%{x}: $%{y:,.0f}<extra>Buying Power</extra>"), row=2, col=1)
+    fig.update_layout(title="Capital & Cash Accounting",
+                      height=750, hovermode="x unified")
+    _showly(fig, "i03_capital.html")
+
+
+def iplot_04_monthly(pf):
+    mo  = pf["cash"].resample("ME").last().pct_change().dropna() * 100
+    bmo = pf["bah_cash_equiv"].resample("ME").last().pct_change().dropna() * 100
+    bmo = bmo.reindex(mo.index)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=mo.index, y=mo.values, name="Cash Return",
+        marker_color=[C["win"] if v >= 0 else C["loss"] for v in mo.values],
+        hovertemplate="%{x|%b %Y}: %{y:.2f}%<extra>Cash</extra>"))
+    fig.add_trace(go.Scatter(
+        x=bmo.index, y=bmo.values, name="SPY Reference",
+        line=dict(color=C["spy"], width=1.5),
+        hovertemplate="%{x|%b %Y}: %{y:.2f}%<extra>SPY</extra>"))
+    fig.add_hline(y=0, line_color=C["border"], line_dash="dash")
+    fig.update_layout(title="Monthly Cash Returns vs SPY Reference",
+                      yaxis_title="Monthly Return (%)", height=500, bargap=0.1)
+    _showly(fig, "i04_monthly_returns.html")
+
+
+def iplot_05_spread(trades_df):
+    done = _active(trades_df).sort_values("entry_date")
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        subplot_titles=["Strike Levels vs SPY Spot ($)",
+                                        "Implied Volatility at Entry (%)"],
+                        vertical_spacing=0.08)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["spy_entry"],
+                              name="SPY Spot", line=dict(color=C["spy"], width=2),
+                              mode="lines+markers", marker=dict(size=4)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["K_s"],
+                              name=f"Short K ({SHORT_PUT_OTM}% OTM)",
+                              line=dict(color="#E67E22", width=1.5, dash="dash"),
+                              mode="lines+markers", marker=dict(size=3)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["K_l"],
+                              name=f"Long K ({LONG_PUT_OTM}% OTM)",
+                              line=dict(color=C["loss"], width=1.5, dash="dot"),
+                              mode="lines+markers", marker=dict(size=3)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["sig_short"] * 100,
+                              name="Short IV", line=dict(color="#E67E22", width=1.5),
+                              mode="lines+markers", marker=dict(size=3)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["sig_long"] * 100,
+                              name="Long IV", line=dict(color=C["loss"], width=1.5),
+                              mode="lines+markers", marker=dict(size=3)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["vix_entry"],
+                              name="VIX", line=dict(color=C["vix"], width=1, dash="dot"),
+                              mode="lines+markers", marker=dict(size=3)), row=2, col=1)
+    fig.update_layout(title="Spread Levels & Implied Vol Over Time",
+                      height=700, hovermode="x unified")
+    _showly(fig, "i05_spread_detail.html")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    if IN_JUPYTER and DISP_OK:
+        _disp(_HTML(f"""
+        <div style="background:#0D1117;border:1px solid #374151;border-radius:8px;
+                    padding:18px 26px;font-family:monospace;margin:10px 0">
+          <h2 style="color:#9B59B6;margin:0 0 6px">SPY Put Spread Backtester</h2>
+          <p style="color:#9CA3AF;margin:0;font-size:12px">
+            Day <b style="color:#E5E7EB">{TRADE_DAY}</b> &nbsp;|&nbsp;
+            Min VIX <b style="color:#E5E7EB">{MIN_VIX}</b> &nbsp;|&nbsp;
+            Short <b style="color:#E5E7EB">{SHORT_PUT_OTM}%</b> OTM &nbsp;|&nbsp;
+            Long <b style="color:#E5E7EB">{LONG_PUT_OTM}%</b> OTM &nbsp;|&nbsp;
+            Stop <b style="color:#E5E7EB">{STOP_LOSS_PCT}%</b> of max loss
+          </p>
+        </div>"""))
+
+    _hdr("Step 1 — Fetching Market Data")
+    df = fetch_data()
+
+    _hdr("Step 2 — Running Backtest")
+    trades_df, pf, pf_mo = run_backtest(df)
+    m = compute_metrics(trades_df, pf, pf_mo)
+    print(f"  Trades executed : {m['n_trades']:,}")
+    print(f"  Months skipped  : {m['vix_skipped']:,}  (VIX < {MIN_VIX})")
+    print(f"  Win rate        : {m['win_rate']:.2%}")
+    print(f"  CAGR (cash)     : {m['cagr']:.2%}")
+    print(f"  Sharpe          : {m['sharpe']:.2f}")
+    print(f"  Max Drawdown    : {m['max_drawdown']:.2%}")
+    print(f"  Initial Cash    : ${m['initial_cash']:,.0f}")
+    print(f"  Final Cash      : ${m['final_cash']:,.0f}")
+
+    _hdr("Step 3 — Static Charts")
+
+    _hdr("01 — Cash Equity Curve / Drawdown / Rolling Sharpe / Monthly P&L")
+    chart_01_equity(pf, pf_mo, trades_df, m)
+
+    _hdr("02 — Trade Analysis")
+    chart_02_trades(trades_df, pf)
+
+    _hdr("03 — Monthly P&L Heatmap")
+    chart_03_heatmap(trades_df)
+
+    _hdr("04 — Spread Pricing Detail")
+    chart_04_spread_detail(trades_df)
+
+    _hdr("05 — Capital & Cash Accounting")
+    chart_05_capital(trades_df, pf, pf_mo)
+
+    _hdr("06 — Rolling Metrics")
+    chart_06_rolling(pf, pf_mo)
+
+    _hdr("07 — Win/Loss Deep Dive")
+    chart_07_win_loss(trades_df)
+
+    _hdr("08 — Return Attribution")
+    chart_08_attribution(pf, pf_mo, trades_df)
+
+    _hdr("09 — Metrics Summary Card")
+    chart_09_metrics(m, trades_df)
+
+    _hdr("Step 4 — Interactive Charts")
+
+    _hdr("i01 — Cash Balance Curve with Trade Markers")
+    iplot_01_equity(pf, pf_mo, trades_df, m)
+
+    _hdr("i02 — Trade P&L Waterfall")
+    iplot_02_waterfall(trades_df)
+
+    _hdr("i03 — Capital & Cash Accounting")
+    iplot_03_capital(pf, pf_mo, trades_df)
+
+    _hdr("i04 — Monthly Cash Returns")
+    iplot_04_monthly(pf)
+
+    _hdr("i05 — Spread Levels & IV Over Time")
+    iplot_05_spread(trades_df)
+
+    _hdr("Performance Summary")
+    rows = [
+        ("CAGR (cash only)",      f"{m['cagr']:.2%}"),
+        ("Total Return (cash)",   f"{m['total_return']:.2%}"),
+        ("Sharpe Ratio",          f"{m['sharpe']:.2f}"),
+        ("Sortino Ratio",         f"{m['sortino']:.2f}"),
+        ("Calmar Ratio",          f"{m['calmar']:.2f}"),
+        ("Max Drawdown",          f"{m['max_drawdown']:.2%}"),
+        ("Annual Vol",            f"{m['annual_vol']:.2%}"),
+        ("Win Rate",              f"{m['win_rate']:.2%}"),
+        ("Profit Factor",         f"{m['profit_factor']:.2f}"),
+        ("Total Trades",          f"{m['n_trades']:,}"),
+        ("VIX-Skipped Months",    f"{m['vix_skipped']:,}"),
+        ("Stop-Loss Rate",        f"{m['stop_loss_rate']:.2%}"),
+        ("Avg Win",               f"${m['avg_win']:,.0f}"),
+        ("Avg Loss",              f"${m['avg_loss']:,.0f}"),
+        ("Options P&L",           f"${m['total_pnl']:,.0f}"),
+        ("Initial Cash",          f"${m['initial_cash']:,.0f}"),
+        ("Final Cash",            f"${m['final_cash']:,.0f}"),
+    ]
+    if IN_JUPYTER and DISP_OK:
+        rows_html = "".join(
+            f"<tr style='background:{'#111827' if i%2==0 else '#1F2937'}'>"
+            f"<td style='padding:5px 16px;color:#9CA3AF;font-family:monospace'>{k}</td>"
+            f"<td style='padding:5px 16px;color:#E5E7EB;font-family:monospace;"
+            f"font-weight:bold;text-align:right'>{v}</td></tr>"
+            for i, (k, v) in enumerate(rows))
+        _disp(_HTML(f"""
+        <table style="border-collapse:collapse;background:#0D1117;
+                      border:1px solid #374151;border-radius:6px;
+                      margin:8px 0;font-size:12.5px;min-width:340px">
+          <thead><tr style="background:#1E3A5F">
+            <th style="padding:8px 16px;color:white;text-align:left;
+                       font-family:monospace">Metric</th>
+            <th style="padding:8px 16px;color:white;text-align:right;
+                       font-family:monospace">Value</th>
+          </tr></thead>
+          <tbody>{rows_html}</tbody>
+        </table>"""))
+    else:
+        for k, v in rows:
+            print(f"  {k:<26}: {v}")
+
+    print(f"\n  Outputs → {OUT_DIR}/")
+    return trades_df, pf, pf_mo, m
+
+
+if __name__ == "__main__":
+    trades_df, pf, pf_mo, m = main()
+    done = _active(trades_df).sort_values("entry_date")
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    fig.suptitle("Return Attribution", fontsize=13, fontweight="bold")
+
+    # 1: Rolling 12M alpha
+    strat_12m = (1 + pf["returns"]).rolling(252).apply(np.prod) - 1
+    bah_12m   = (1 + pf["bah_returns"]).rolling(252).apply(np.prod) - 1
+    alpha     = strat_12m - bah_12m
+
+    ax = axes[0, 0]
+    ax.fill_between(alpha.index, alpha * 100, 0,
+                    where=(alpha >= 0), color=C["win"],  alpha=0.55, label="Outperform")
+    ax.fill_between(alpha.index, alpha * 100, 0,
+                    where=(alpha < 0),  color=C["loss"], alpha=0.55, label="Underperform")
+    ax.axhline(0, color=C["border"], lw=0.6)
+    ax.set_ylabel("Excess Return vs SPY (pp)")
+    ax.set_title("Rolling 12-Month Alpha vs SPY B&H")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # 2: Total value decomposed
+    ax = axes[0, 1]
+    init_spy = pf["spy_value"].iloc[0]
+    spy_gain = pf["spy_value"] - init_spy
+    opt_gain = pf["cash"] - INITIAL_CASH
+    ax.stackplot(pf.index,
+                 [spy_gain.clip(lower=0), opt_gain.clip(lower=0)],
+                 labels=["SPY Price Gain", "Options Premium Gain"],
+                 colors=[C["spy"], C["win"]], alpha=0.75)
+    ax.stackplot(pf.index,
+                 [spy_gain.clip(upper=0), opt_gain.clip(upper=0)],
+                 colors=[C["spy"], C["loss"]], alpha=0.4)
+    ax.set_title("Gain Attribution — SPY vs Options Premium")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    ax.legend(fontsize=8, loc="upper left"); ax.grid(True)
+
+    # 3: SPY vs Strategy 12M return
+    ax = axes[1, 0]
+    ax.plot(strat_12m.index, strat_12m * 100, color=C["port"], lw=1.8, label="Strategy")
+    ax.plot(bah_12m.index,   bah_12m   * 100, color=C["spy"],  lw=1.4, alpha=0.75,
+            label="SPY B&H")
+    ax.axhline(0, color=C["border"], lw=0.6, ls="--")
+    ax.set_ylabel("Rolling 12M Return (%)")
+    ax.set_title("Rolling 1-Year Return Comparison")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    # 4: Correlation of monthly returns
+    mo_s   = pf["returns"].resample("ME").apply(lambda x: (1+x).prod()-1)
+    mo_bah = pf["bah_returns"].resample("ME").apply(lambda x: (1+x).prod()-1)
+    mo_s   = mo_s.reindex(mo_bah.index).dropna()
+    mo_bah = mo_bah.reindex(mo_s.index).dropna()
+
+    ax = axes[1, 1]
+    ax.scatter(mo_bah * 100, mo_s * 100,
+               c=[C["win"] if v >= 0 else C["loss"] for v in mo_s],
+               alpha=0.6, s=20)
+    z = np.polyfit(mo_bah * 100, mo_s * 100, 1)
+    xl = np.linspace(mo_bah.min()*100, mo_bah.max()*100, 100)
+    ax.plot(xl, np.polyval(z, xl), color="white", lw=1.2, ls="--",
+            label=f"β={z[0]:.2f}")
+    ax.axhline(0, color=C["border"], lw=0.5, ls=":")
+    ax.axvline(0, color=C["border"], lw=0.5, ls=":")
+    corr = np.corrcoef(mo_bah, mo_s)[0, 1]
+    ax.set_xlabel("SPY Monthly Return (%)"); ax.set_ylabel("Strategy Monthly Return (%)")
+    ax.set_title(f"Monthly Return Correlation  ρ={corr:.2f}")
+    ax.legend(fontsize=8); ax.grid(True)
+
+    plt.tight_layout()
+    _show(fig, "08_attribution.png")
+
+
+# ── Chart 09 — Metrics summary card ──────────────────────────────────────────
+def chart_09_metrics(m, trades_df):
+    done = _active(trades_df)
+
+    perf = [
+        ["CAGR",              f"{m['cagr']:.2%}"],
+        ["Total Return",      f"{m['total_return']:.2%}"],
+        ["Sharpe Ratio",      f"{m['sharpe']:.2f}"],
+        ["Sortino Ratio",     f"{m['sortino']:.2f}"],
+        ["Calmar Ratio",      f"{m['calmar']:.2f}"],
+        ["Annual Volatility", f"{m['annual_vol']:.2%}"],
+        ["Max Drawdown",      f"{m['max_drawdown']:.2%}"],
+        ["Win Rate",          f"{m['win_rate']:.2%}"],
+        ["Profit Factor",     f"{m['profit_factor']:.2f}"],
+        ["Total Trades",      f"{m['n_trades']:,}"],
+        ["Months Skipped (VIX<14)", f"{m['vix_skipped']:,}"],
+        ["Avg Win",           f"${m['avg_win']:,.0f}"],
+        ["Avg Loss",          f"${m['avg_loss']:,.0f}"],
+        ["Stop-Loss Rate",    f"{m['stop_loss_rate']:.2%}"],
+        ["Options P&L",       f"${m['total_pnl']:,.0f}"],
+        ["Initial Value",     f"${m['initial_value']:,.0f}"],
+        ["Final Value",       f"${m['final_value']:,.0f}"],
+        ["Years Tested",      f"{m['years']:.1f}"],
+    ]
+    params = [
+        ["Entry Day of Month",  f"{TRADE_DAY}"],
+        ["Min VIX Threshold",   f"{MIN_VIX}"],
+        ["Short Put OTM",       f"{SHORT_PUT_OTM}%  (K = spot × {1-SHORT_PUT_OTM/100:.2f})"],
+        ["Long Put OTM",        f"{LONG_PUT_OTM}%  (K = spot × {1-LONG_PUT_OTM/100:.2f})"],
+        ["Spread Width",        f"{LONG_PUT_OTM - SHORT_PUT_OTM:.0f}% of spot"],
+        ["Stop Loss",           f"{STOP_LOSS_PCT}% of max loss"],
+        ["Expiry",              "Exactly 1 calendar month"],
+        ["Initial Cash",        f"${INITIAL_CASH:,.0f}  (100% margin)"],
+        ["Initial SPY Value",   f"${INITIAL_SPY_VALUE:,.0f}  (25% margin)"],
+        ["Contract Size",       f"{CONTRACT_SIZE} shares"],
+    ]
+
+    fig, ax = plt.subplots(figsize=(15, 10))
+    ax.axis("off")
+    fig.patch.set_facecolor(C["bg"])
+
+    def _tbl(rows, cols, bbox):
+        t = ax.table(cellText=rows, colLabels=cols, loc="center", bbox=bbox)
+        t.auto_set_font_size(False); t.set_fontsize(9.5)
+        for (r, c), cell in t.get_celld().items():
+            cell.set_edgecolor(C["border"])
+            if r == 0:
+                cell.set_facecolor("#1E3A5F")
+                cell.set_text_props(color="white", fontweight="bold")
+            else:
+                cell.set_facecolor("#111827" if r % 2 else "#1F2937")
+                cell.set_text_props(color=C["text"])
+
+    _tbl(perf,   ["Metric", "Value"],     [0.0,  0.0,  0.46, 1.0])
+    _tbl(params, ["Parameter", "Value"],  [0.54, 0.26, 0.46, 0.74])
+
+    ax.set_title("Strategy Summary Card", fontsize=14, fontweight="bold",
+                 color=C["text"], pad=14)
+    _show(fig, "09_metrics_card.png")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — INTERACTIVE PLOTLY CHARTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def iplot_01_equity(pf, trades_df, m):
+    done = _active(trades_df)
+    ret  = pf["returns"]
+    cum  = (1 + ret).cumprod()
+    dd   = (cum - cum.cummax()) / cum.cummax() * 100
+
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        subplot_titles=["Portfolio Value ($)", "Drawdown (%)", "VIX"],
+        row_heights=[0.55, 0.25, 0.20], vertical_spacing=0.04)
+
+    fig.add_trace(go.Scatter(
+        x=pf.index, y=pf["total_value"], name="Put Spread Strategy",
+        line=dict(color=C["port"], width=2.2),
+        hovertemplate="$%{y:,.0f}<extra>Strategy</extra>"), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=pf.index, y=pf["bah_value"], name="SPY Buy & Hold",
+        line=dict(color=C["spy"], width=1.5),
+        hovertemplate="$%{y:,.0f}<extra>SPY B&H</extra>"), row=1, col=1)
+
+    wins = done[done["total_pnl"] >= 0]
+    lsss = done[done["total_pnl"] <  0]
+    fig.add_trace(go.Scatter(
+        x=wins["exit_date"], y=pf["total_value"].reindex(wins["exit_date"]).values,
+        mode="markers", name="Win Exit",
+        marker=dict(color=C["win"], size=7, symbol="triangle-up"),
+        customdata=wins["total_pnl"].values,
+        hovertemplate="Win: $%{customdata:,.0f}<extra></extra>"), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=lsss["exit_date"], y=pf["total_value"].reindex(lsss["exit_date"]).values,
+        mode="markers", name="Loss / Stop Exit",
+        marker=dict(color=C["loss"], size=7, symbol="triangle-down"),
+        customdata=lsss[["total_pnl", "exit_reason"]].values,
+        hovertemplate="Loss: $%{customdata[0]:,.0f} (%{customdata[1]})<extra></extra>"),
+        row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=dd.index, y=dd.values, name="Drawdown",
+        fill="tozeroy", fillcolor="rgba(231,76,60,0.25)",
+        line=dict(color=C["loss"], width=1)), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=pf.index, y=pf["vix"], name="VIX",
+        fill="tozeroy", fillcolor="rgba(149,165,166,0.12)",
+        line=dict(color=C["vix"], width=1)), row=3, col=1)
+
+    fig.add_hline(y=MIN_VIX, row=3, col=1, line_dash="dash", line_color="orange",
+                  annotation_text=f"Min VIX {MIN_VIX}")
+
+    fig.update_layout(
+        title=(f"SPY Put Spread — Interactive Equity Curve  "
+               f"│  CAGR {m['cagr']:.2%}  │  Sharpe {m['sharpe']:.2f}  │  "
+               f"Max DD {m['max_drawdown']:.2%}"),
+        height=900, hovermode="x unified")
+    _showly(fig, "i01_equity_curve.html")
+
+
+def iplot_02_waterfall(trades_df):
+    done = _active(trades_df).sort_values("entry_date").copy()
+    done["cum_pnl"] = done["total_pnl"].cumsum()
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        subplot_titles=["Trade P&L ($)", "Cumulative P&L ($)"],
+                        vertical_spacing=0.08)
+
+    fig.add_trace(go.Bar(
+        x=done["entry_date"], y=done["total_pnl"],
+        name="Trade P&L",
+        marker_color=[C["win"] if v >= 0 else C["loss"] for v in done["total_pnl"]],
+        customdata=np.stack([done["vix_entry"], done["n_contracts"],
+                             done["K_s"].round(2), done["K_l"].round(2),
+                             done["exit_reason"]], axis=-1),
+        hovertemplate=(
+            "<b>Entry:</b> %{x}<br><b>P&L:</b> $%{y:,.0f}<br>"
+            "<b>VIX:</b> %{customdata[0]:.1f}<br>"
+            "<b>Contracts:</b> %{customdata[1]}<br>"
+            "<b>Short K:</b> $%{customdata[2]}<br>"
+            "<b>Long K:</b> $%{customdata[3]}<br>"
+            "<b>Exit:</b> %{customdata[4]}<extra></extra>"
+        )), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=done["entry_date"], y=done["cum_pnl"],
+        name="Cumulative P&L",
+        line=dict(color=C["port"], width=2.2),
+        fill="tozeroy", fillcolor="rgba(155,89,182,0.15)"), row=2, col=1)
+
+    fig.update_layout(title="Trade P&L Waterfall — hover for details",
+                      height=720, bargap=0.12)
+    _showly(fig, "i02_trade_waterfall.html")
+
+
+def iplot_03_capital(pf, trades_df):
+    done = _active(trades_df).sort_values("entry_date")
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        subplot_titles=["Portfolio Composition ($)",
+                                        "Cash Balance & Buying Power at Entry ($)"],
+                        vertical_spacing=0.08)
+
+    fig.add_trace(go.Scatter(
+        x=pf.index, y=pf["spy_value"],
+        name="SPY Value", fill="tozeroy",
+        fillcolor="rgba(243,156,18,0.25)",
+        line=dict(color=C["spy"], width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=pf.index, y=pf["total_value"],
+        name="Total Value",
+        line=dict(color=C["port"], width=2)), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=done["entry_date"], y=done["cash_entry"],
+        name="Cash at Entry", mode="lines+markers",
+        line=dict(color=C["win"], width=1.8),
+        marker=dict(size=5)), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=done["entry_date"], y=done["buying_power"],
+        name="Buying Power", mode="lines+markers",
+        line=dict(color=C["gold"], width=1.8, dash="dash"),
+        marker=dict(size=5)), row=2, col=1)
+
+    fig.update_layout(title="Capital & Cash Accounting — Interactive",
+                      height=750, hovermode="x unified")
+    _showly(fig, "i03_capital.html")
+
+
+def iplot_04_monthly(pf):
+    mo  = pf["total_value"].resample("ME").last().pct_change().dropna() * 100
+    bmo = pf["bah_value"].resample("ME").last().pct_change().dropna() * 100
+    bmo = bmo.reindex(mo.index)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=mo.index, y=mo.values, name="Strategy",
+        marker_color=[C["win"] if v >= 0 else C["loss"] for v in mo.values],
+        hovertemplate="%{x|%b %Y}: %{y:.2f}%<extra>Strategy</extra>"))
+    fig.add_trace(go.Scatter(
+        x=bmo.index, y=bmo.values, name="SPY B&H",
+        line=dict(color=C["spy"], width=1.5),
+        hovertemplate="%{x|%b %Y}: %{y:.2f}%<extra>SPY B&H</extra>"))
+    fig.add_hline(y=0, line_color=C["border"], line_dash="dash")
+    fig.update_layout(title="Monthly Returns — Strategy vs SPY",
+                      yaxis_title="Monthly Return (%)", height=500, bargap=0.1)
+    _showly(fig, "i04_monthly_returns.html")
+
+
+def iplot_05_spread(trades_df):
+    done = _active(trades_df).sort_values("entry_date")
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        subplot_titles=["Strike Levels vs SPY Spot ($)",
+                                        "Implied Vol at Entry (%)"],
+                        vertical_spacing=0.08)
+
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["spy_entry"],
+                              name="SPY Spot", line=dict(color=C["spy"], width=2)),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["K_s"],
+                              name=f"Short K ({SHORT_PUT_OTM}% OTM)",
+                              line=dict(color="#E67E22", width=1.5, dash="dash")),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["K_l"],
+                              name=f"Long K ({LONG_PUT_OTM}% OTM)",
+                              line=dict(color=C["loss"], width=1.5, dash="dot")),
+                  row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["sig_short"] * 100,
+                              name="Short Put IV", line=dict(color="#E67E22", width=1.5)),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["sig_long"] * 100,
+                              name="Long Put IV", line=dict(color=C["loss"], width=1.5)),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(x=done["entry_date"], y=done["vix_entry"],
+                              name="VIX", line=dict(color=C["vix"], width=1, dash="dot")),
+                  row=2, col=1)
+
+    fig.update_layout(title="Spread Levels & Implied Volatility Over Time",
+                      height=700, hovermode="x unified")
+    _showly(fig, "i05_spread_detail.html")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    if IN_JUPYTER and DISP_OK:
+        _disp(_HTML(f"""
+        <div style="background:#0D1117;border:1px solid #374151;border-radius:8px;
+                    padding:18px 26px;font-family:monospace;margin:10px 0">
+          <h2 style="color:#9B59B6;margin:0 0 6px">SPY Put Spread Backtester</h2>
+          <p style="color:#9CA3AF;margin:0;font-size:12px">
+            Day <b style="color:#E5E7EB">{TRADE_DAY}</b> &nbsp;|&nbsp;
+            Min VIX <b style="color:#E5E7EB">{MIN_VIX}</b> &nbsp;|&nbsp;
+            Short <b style="color:#E5E7EB">{SHORT_PUT_OTM}%</b> OTM &nbsp;|&nbsp;
+            Long <b style="color:#E5E7EB">{LONG_PUT_OTM}%</b> OTM &nbsp;|&nbsp;
+            Stop <b style="color:#E5E7EB">{STOP_LOSS_PCT}%</b> of max loss
+          </p>
+        </div>
+        """))
+    else:
+        print("═" * 65)
+        print("  SPY PUT SPREAD BACKTEST — FIXED PARAMETERS")
+        print("═" * 65)
+
+    # 1. Data
+    _hdr("Step 1 — Fetching Market Data")
+    df = fetch_data()
+
+    # 2. Backtest
+    _hdr("Step 2 — Running Backtest")
+    trades_df, pf = run_backtest(df)
+    m = compute_metrics(trades_df, pf)
+    done = _active(trades_df)
+    print(f"  Trades executed : {m['n_trades']:,}")
+    print(f"  Months skipped  : {m['vix_skipped']:,}  (VIX < {MIN_VIX})")
+    print(f"  Win rate        : {m['win_rate']:.2%}")
+    print(f"  CAGR            : {m['cagr']:.2%}")
+    print(f"  Sharpe          : {m['sharpe']:.2f}")
+    print(f"  Max Drawdown    : {m['max_drawdown']:.2%}")
+    print(f"  Final Value     : ${m['final_value']:,.0f}")
+
+    # 3. Static charts
+    _hdr("Step 3 — Static Charts")
+
+    _hdr("01 — Equity Overview (Equity Curve / Drawdown / Rolling Sharpe / Monthly Returns)")
+    chart_01_equity(pf, trades_df, m)
+
+    _hdr("02 — Trade Analysis (P&L Distribution / VIX / Cumulative / Sizing / Credit)")
+    chart_02_trades(trades_df, pf)
+
+    _hdr("03 — Monthly P&L Heatmap")
+    chart_03_heatmap(trades_df)
+
+    _hdr("04 — Spread Detail (IVs / Premium / Credit% / Strike Levels)")
+    chart_04_spread_detail(trades_df)
+
+    _hdr("05 — Capital Accounting (Composition / Cash / Buying Power)")
+    chart_05_capital(trades_df, pf)
+
+    _hdr("06 — Rolling Metrics (Sharpe / Vol / Return / Max DD)")
+    chart_06_rolling(pf)
+
+    _hdr("07 — Win/Loss Deep Dive (ECDF / Duration / Exit Reason / Streaks / Annual)")
+    chart_07_win_loss(trades_df)
+
+    _hdr("08 — Return Attribution (Alpha / Composition / Correlation)")
+    chart_08_attribution(pf, trades_df)
+
+    _hdr("09 — Metrics Summary Card")
+    chart_09_metrics(m, trades_df)
+
+    # 4. Interactive Plotly
+    _hdr("Step 4 — Interactive Charts")
+
+    _hdr("i01 — Full Equity Curve with Trade Markers")
+    iplot_01_equity(pf, trades_df, m)
+
+    _hdr("i02 — Trade P&L Waterfall (hover for full trade detail)")
+    iplot_02_waterfall(trades_df)
+
+    _hdr("i03 — Capital & Cash Accounting")
+    iplot_03_capital(pf, trades_df)
+
+    _hdr("i04 — Monthly Returns vs SPY")
+    iplot_04_monthly(pf)
+
+    _hdr("i05 — Spread Levels & Implied Vol Over Time")
+    iplot_05_spread(trades_df)
+
+    # 5. Final summary
+    _hdr("Performance Summary")
+    rows = [
+        ("CAGR",              f"{m['cagr']:.2%}"),
+        ("Total Return",      f"{m['total_return']:.2%}"),
+        ("Sharpe Ratio",      f"{m['sharpe']:.2f}"),
+        ("Sortino Ratio",     f"{m['sortino']:.2f}"),
+        ("Calmar Ratio",      f"{m['calmar']:.2f}"),
+        ("Max Drawdown",      f"{m['max_drawdown']:.2%}"),
+        ("Annual Vol",        f"{m['annual_vol']:.2%}"),
+        ("Win Rate",          f"{m['win_rate']:.2%}"),
+        ("Profit Factor",     f"{m['profit_factor']:.2f}"),
+        ("Total Trades",      f"{m['n_trades']:,}"),
+        ("VIX-Skipped Months",f"{m['vix_skipped']:,}"),
+        ("Stop-Loss Rate",    f"{m['stop_loss_rate']:.2%}"),
+        ("Avg Win",           f"${m['avg_win']:,.0f}"),
+        ("Avg Loss",          f"${m['avg_loss']:,.0f}"),
+        ("Options P&L",       f"${m['total_pnl']:,.0f}"),
+        ("Final Value",       f"${m['final_value']:,.0f}"),
+    ]
+
+    if IN_JUPYTER and DISP_OK:
+        rows_html = "".join(
+            f"<tr style='background:{'#111827' if i%2==0 else '#1F2937'}'>"
+            f"<td style='padding:5px 16px;color:#9CA3AF;font-family:monospace'>{k}</td>"
+            f"<td style='padding:5px 16px;color:#E5E7EB;font-family:monospace;"
+            f"font-weight:bold;text-align:right'>{v}</td></tr>"
+            for i, (k, v) in enumerate(rows))
+        _disp(_HTML(f"""
+        <table style="border-collapse:collapse;background:#0D1117;
+                      border:1px solid #374151;border-radius:6px;
+                      margin:8px 0;font-size:12.5px;min-width:340px">
+          <thead><tr style="background:#1E3A5F">
+            <th style="padding:8px 16px;color:white;text-align:left;
+                       font-family:monospace">Metric</th>
+            <th style="padding:8px 16px;color:white;text-align:right;
+                       font-family:monospace">Value</th>
+          </tr></thead>
+          <tbody>{rows_html}</tbody>
+        </table>"""))
+    else:
+        for k, v in rows:
+            print(f"  {k:<24}: {v}")
+
+    print(f"\n  Outputs saved to: {OUT_DIR}/")
+    return trades_df, pf, m
+
+
+if __name__ == "__main__":
+    trades_df, pf, m = main()
